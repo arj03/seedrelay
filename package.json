@@ -1,0 +1,24 @@
+{
+  "name": "seedrelay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "App-neutral WebSocket rendezvous and reconnectable signaling client for SeedKernel WebRTC meshes.",
+  "exports": {
+    ".": "./client.js"
+  },
+  "bin": {
+    "seedrelay": "./server.mjs"
+  },
+  "files": [
+    "client.js",
+    "server.mjs"
+  ],
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
