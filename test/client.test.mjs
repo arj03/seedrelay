@@ -104,3 +104,98 @@ test("rejects invalid factories, callbacks, URLs, and non-JSON messages", () => 
   assert.throws(() => relay.signaling.onMessage(null), /callback/);
   assert.throws(() => relay.signaling.send(undefined), /JSON-serializable/);
 });
+
+test("queued signaling never crosses room or server boundaries", () => {
+  const { relay, sockets } = fixture();
+  relay.connect("wss://relay.test/private");
+  relay.signaling.send({ sdp: "private offer" });
+  relay.disconnect();
+  relay.connect("wss://relay.test/public");
+  sockets[1].dispatch("open");
+  assert.deepEqual(sockets[1].sent, []);
+  relay.disconnect();
+  relay.signaling.send({ candidate: "private address" });
+  relay.connect("wss://different.test/public");
+  sockets[2].dispatch("open");
+  assert.deepEqual(sockets[2].sent, []);
+});
+
+test("failed destination changes cannot retain another room's messages", () => {
+  const sockets = [];
+  const relay = createRelaySignaling({ webSocketFactory(url) {
+    if (url.endsWith("/bad")) throw new Error("failed");
+    const socket = new FakeWebSocket(url); sockets.push(socket); return socket;
+  } });
+  relay.connect("wss://relay.test/private");
+  relay.signaling.send({ secret: true });
+  assert.throws(() => relay.connect("wss://relay.test/bad"), /failed/);
+  relay.connect("wss://relay.test/public");
+  sockets[1].dispatch("open");
+  assert.deepEqual(sockets[1].sent, []);
+});
+
+test("offline queue has message and UTF-8 byte limits, freed on close", () => {
+  const { relay, sockets } = fixture();
+  for (let i = 0; i < 256; i++) relay.signaling.send({ i });
+  assert.throws(() => relay.signaling.send({ overflow: true }), /buffer is full/);
+  relay.signaling.close();
+  // Each JSON string is exactly 64 KiB in UTF-8, despite fewer JS characters.
+  const message = "é".repeat(32767);
+  for (let i = 0; i < 4; i++) relay.signaling.send(message);
+  assert.throws(() => relay.signaling.send("x"), /buffer is full/);
+  assert.throws(() => relay.signaling.send(message + "é"), /exceeds 64 KiB/);
+  relay.connect("wss://relay.test/room");
+  sockets[0].dispatch("open");
+  assert.equal(sockets[0].sent.length, 4);
+  relay.signaling.send("after drain");
+  assert.equal(sockets[0].sent.length, 5);
+});
+
+test("connected sends account for the WebSocket's own buffered bytes", () => {
+  const { relay, sockets } = fixture();
+  relay.connect("wss://relay.test/room");
+  sockets[0].dispatch("open");
+  sockets[0].bufferedAmount = 256 * 1024;
+  assert.throws(() => relay.signaling.send("x"), /buffer is full/);
+  assert.deepEqual(sockets[0].sent, []);
+  sockets[0].bufferedAmount = 0;
+  relay.signaling.send("x");
+  assert.deepEqual(sockets[0].sent, ['"x"']);
+});
+
+test("a failed flush preserves its message for the same destination", () => {
+  const { relay, sockets, states } = fixture();
+  relay.connect("wss://relay.test/room");
+  relay.signaling.send({ retry: true });
+  sockets[0].send = () => { throw new Error("closed"); };
+  sockets[0].dispatch("open");
+  assert.equal(states.at(-1)[0], "disconnected");
+  relay.connect("wss://relay.test/room");
+  sockets[1].dispatch("open");
+  assert.deepEqual(sockets[1].sent, ['{"retry":true}']);
+});
+
+test("queued messages wait for transport capacity and resume in order", async () => {
+  const { relay, sockets } = fixture();
+  relay.connect("wss://relay.test/room");
+  relay.signaling.send({ first: true });
+  relay.signaling.send({ second: true });
+  sockets[0].bufferedAmount = 256 * 1024;
+  sockets[0].dispatch("open");
+  assert.deepEqual(sockets[0].sent, []);
+  sockets[0].bufferedAmount = 0;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(sockets[0].sent, ['{"first":true}', '{"second":true}']);
+  relay.signaling.close();
+});
+
+test("oversized incoming text is disconnected before reaching the consumer", () => {
+  const { relay, sockets } = fixture();
+  let calls = 0;
+  relay.signaling.onMessage(() => calls++);
+  relay.connect("wss://relay.test/room");
+  sockets[0].dispatch("open");
+  sockets[0].dispatch("message", { data: JSON.stringify("é".repeat(32768)) });
+  assert.equal(sockets[0].closed, true);
+  assert.equal(calls, 0);
+});

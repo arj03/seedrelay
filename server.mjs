@@ -25,7 +25,7 @@
 // relay itself does not inspect them. SeedKernel signatures and trust are
 // still verified end-to-end inside each peer's kernel pipeline.
 //
-// No third-party dependencies: hand-rolled RFC 6455 framing in ~150 lines.
+// No third-party dependencies.
 //
 // Run: seedrelay [port] [options]  (or: node server.mjs)
 //   --host HOST            interface to bind (default 127.0.0.1)
@@ -35,10 +35,13 @@
 //   --max-per-room N       sockets per room                (env RELAY_MAX_PER_ROOM)
 //   --max-per-ip N         sockets per client address      (env RELAY_MAX_PER_IP)
 //   --heartbeat-secs N     ping/reap interval, 0=off       (env RELAY_HEARTBEAT_SECS)
-//   --trust-proxy          read client IP from X-Forwarded-For (env RELAY_TRUST_PROXY=1)
+//   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
+//   --trust-proxy          legacy flag; requires explicit trusted proxy addresses
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
+import { isUtf8 } from "node:buffer";
+import { isIP } from "node:net";
 
 // ─── CLI parsing ─────────────────────────────────────────────────────────
 
@@ -62,6 +65,26 @@ let MAX_CONNS_PER_ROOM = num(process.env.RELAY_MAX_PER_ROOM,       64);
 let MAX_CONNS_PER_IP   = num(process.env.RELAY_MAX_PER_IP,         64);
 let HEARTBEAT_MS       = num(process.env.RELAY_HEARTBEAT_SECS,     30) * 1000;
 let TRUST_PROXY        = process.env.RELAY_TRUST_PROXY === "1";
+const TRUSTED_PROXIES = new Set();
+function normalizeIp(value) {
+  // Scoped IPv6 addresses are accepted by net.isIP but are not valid URL
+  // hosts or portable forwarded addresses. Reject before URL normalization.
+  if (value.includes("%") || !isIP(value)) return null;
+  if (isIP(value) === 4) return value;
+  const normalized = new URL(`http://[${value}]/`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]+):([0-9a-f]+)$/.exec(normalized);
+  if (!mapped) return normalized;
+  const high = parseInt(mapped[1], 16), low = parseInt(mapped[2], 16);
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+}
+function trustProxy(value) {
+  const ip = normalizeIp(value);
+  if (!ip) throw new TypeError("trusted proxy must be an IP address");
+  TRUSTED_PROXIES.add(ip);
+}
+for (const ip of (process.env.RELAY_TRUSTED_PROXIES ?? "").split(",")) {
+  if (ip.trim()) trustProxy(ip.trim());
+}
 
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
@@ -74,13 +97,16 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--max-per-ip") { MAX_CONNS_PER_IP = num(args[++i], MAX_CONNS_PER_IP); }
   else if (a === "--heartbeat-secs") { HEARTBEAT_MS = num(args[++i], HEARTBEAT_MS / 1000) * 1000; }
   else if (a === "--trust-proxy") { TRUST_PROXY = true; }
+  else if (a === "--trusted-proxy") { trustProxy(args[++i] ?? ""); }
   else if (/^\d+$/.test(a)) { PORT = Number(a); }
 }
-// Defaults: localhost over http/https on common dev ports. file:// pages
-// send Origin: null, which is also permitted by default so that an app page
-// opened directly off disk still works.
+if (TRUST_PROXY && TRUSTED_PROXIES.size === 0) {
+  throw new Error("--trust-proxy requires --trusted-proxy IP or RELAY_TRUSTED_PROXIES");
+}
+TRUST_PROXY = TRUSTED_PROXIES.size > 0;
+// Opaque origins (including file pages and sandboxed iframes) are not trusted
+// by default. Operators can explicitly opt in with --allow-origin null.
 if (ALLOWED_ORIGINS.size === 0) {
-  ALLOWED_ORIGINS.add("null");
   for (const scheme of ["http", "https"]) {
     for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
       ALLOWED_ORIGINS.add(`${scheme}://${host}`);
@@ -99,11 +125,37 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // few hundred bytes. 64 KB is room for an unusually fat SDP; anything
 // larger is almost certainly garbage or an attacker probing limits.
 const MAX_FRAME_PAYLOAD = 64 * 1024;
-// If a single client's outbound buffer grows past this, we drop broadcasts
-// to them until they catch up. They're still alive and may receive future
-// frames; we just stop piling up their backlog. 256 KB ≈ ~4 worst-case
-// frames.
+// Every write, including control frames, shares the same hard backlog cap.
 const MAX_SOCKET_BACKLOG = 256 * 1024;
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+// Token buckets bound sustained traffic as well as bursts. Global budgets
+// survive reconnects and room turnover; fan-out is charged per recipient.
+function bucket(rate, burst = rate * 2) {
+  return { rate, burst, tokens: burst, at: performance.now() };
+}
+function spend(b, amount) {
+  const now = performance.now();
+  b.tokens = Math.min(b.burst, b.tokens + (now - b.at) * b.rate / 1000);
+  b.at = now;
+  if (amount > b.tokens) return false;
+  b.tokens -= amount;
+  return true;
+}
+const incomingBytes = bucket(4 * 1024 * 1024);
+const incomingFrames = bucket(8192);
+const outgoingBytes = bucket(16 * 1024 * 1024);
+const outgoingFrames = bucket(16384);
+
+function writeFrame(sock, frame) {
+  if (sock.destroyed || !sock.writable) return false;
+  if (sock.writableLength + frame.length > MAX_SOCKET_BACKLOG) {
+    sock.destroy();
+    return false;
+  }
+  try { sock.write(frame); return true; }
+  catch { sock.destroy(); return false; }
+}
 
 // ─── rooms ───────────────────────────────────────────────────────────────
 //
@@ -123,7 +175,12 @@ const rooms = new Map();
 
 function joinRoom(name, sock) {
   let set = rooms.get(name);
-  if (!set) { set = new Set(); rooms.set(name, set); }
+  if (!set) {
+    set = new Set();
+    set.bytes = bucket(2 * 1024 * 1024);
+    set.frames = bucket(2048);
+    rooms.set(name, set);
+  }
   set.add(sock);
   return set;
 }
@@ -158,23 +215,26 @@ function roomFromRequest(req) {
 // ─── connection tracking ───────────────────────────────────────────────────
 //
 // `sockets` is every live upgraded socket. A socket already lives in exactly
-// one room, but the flat set gives the heartbeat sweep (below) and the global
-// connection cap an O(1) view without walking every room. `ipCounts` is the
-// per-client-address tally backing the per-IP cap; entries are deleted at zero
-// so the map only ever holds currently-connected addresses.
+// one room, but the flat set supports heartbeat sweeps. `ipCounts` tracks
+// upgraded client addresses; `connections` and `addressCounts` include all
+// accepted TCP sockets. Entries are deleted when their counts reach zero.
 const sockets = new Set();
 const ipCounts = new Map();
+const connections = new Set();
+const addressCounts = new Map();
 
-// Client address for the per-IP cap. Behind a reverse proxy every connection
-// arrives from the proxy, so honour X-Forwarded-For only when the operator
-// opted in with --trust-proxy — otherwise a client could forge the header to
-// dodge the cap.
+// Walk from the actual remote address toward the client, stopping at the
+// first untrusted hop. Never trust a client-supplied leftmost XFF value.
 function clientIp(req, sock) {
-  if (TRUST_PROXY) {
+  let ip = normalizeIp(sock.remoteAddress ?? "") ?? "unknown";
+  if (TRUSTED_PROXIES.has(ip)) {
     const xff = req.headers["x-forwarded-for"];
-    if (typeof xff === "string" && xff.length > 0) return xff.split(",")[0].trim();
+    if (typeof xff !== "string" || !xff) return null;
+    const chain = xff.split(",").map((part) => normalizeIp(part.trim()));
+    if (chain.some((part) => part === null)) return null;
+    for (let i = chain.length - 1; i >= 0 && TRUSTED_PROXIES.has(ip); i--) ip = chain[i];
   }
-  return sock.remoteAddress ?? "unknown";
+  return ip;
 }
 
 // Refuse an upgrade with a short HTTP error and tear the socket down. Used for
@@ -190,13 +250,40 @@ function refuse(sock, code, reason, note) {
 // ─── server ──────────────────────────────────────────────────────────────
 
 const server = createServer((_req, res) => {
-  res.writeHead(426, { "Content-Type": "text/plain" });
+  res.writeHead(426, { "Content-Type": "text/plain", "Connection": "close" });
   res.end("WebSocket relay — connect with ws://<host>:<port>/<room>\n");
 });
 
-server.on("upgrade", (req, sock) => {
+// Account for TCP sockets before any HTTP headers arrive. Trusted proxies
+// share the global cap here; their forwarded clients are capped at upgrade.
+server.on("connection", (sock) => {
+  const address = normalizeIp(sock.remoteAddress ?? "") ?? "unknown";
+  if (connections.size >= MAX_CONNECTIONS ||
+      (!TRUSTED_PROXIES.has(address) && (addressCounts.get(address) ?? 0) >= MAX_CONNS_PER_IP)) {
+    sock.destroy();
+    return;
+  }
+  connections.add(sock);
+  addressCounts.set(address, (addressCounts.get(address) ?? 0) + 1);
+  sock._relayHandshakeTimer = setTimeout(() => sock.destroy(), HANDSHAKE_TIMEOUT_MS);
+  sock._relayHandshakeTimer.unref();
+  sock.on("error", () => sock.destroy());
+  sock.once("close", () => {
+    clearTimeout(sock._relayHandshakeTimer);
+    connections.delete(sock);
+    const remaining = addressCounts.get(address) - 1;
+    if (remaining) addressCounts.set(address, remaining);
+    else addressCounts.delete(address);
+  });
+});
+
+server.on("upgrade", (req, sock, head) => {
+  if (sock.destroyed || !connections.has(sock)) { sock.destroy(); return; }
   const key = req.headers["sec-websocket-key"];
-  if (!key) { sock.destroy(); return; }
+  if (req.method !== "GET" || req.headers.upgrade?.toLowerCase() !== "websocket" ||
+      req.headers["sec-websocket-version"] !== "13" ||
+      typeof key !== "string" || !/^[A-Za-z0-9+/]{22}==$/.test(key) ||
+      Buffer.from(key, "base64").length !== 16) { sock.destroy(); return; }
 
   // CSWSH defence: only accept upgrades whose Origin is on the allowlist.
   // The browser fills Origin from the page that initiated the WS, so a
@@ -209,7 +296,7 @@ server.on("upgrade", (req, sock) => {
   if (originStr && !ALLOWED_ORIGINS.has(originStr)) {
     sock.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
     sock.destroy();
-    console.log(`! rejected upgrade from origin=${originStr}`);
+    console.log("! rejected upgrade: origin not allowed");
     return;
   }
 
@@ -217,7 +304,7 @@ server.on("upgrade", (req, sock) => {
   if (room === null) {
     sock.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
     sock.destroy();
-    console.log(`! rejected upgrade: bad room in path ${req.url}`);
+    console.log("! rejected upgrade: bad room path");
     return;
   }
 
@@ -226,12 +313,13 @@ server.on("upgrade", (req, sock) => {
   // room slot or a frame buffer. Caps are independent; the first one tripped
   // wins. Counts are released in drop() when the socket closes.
   const ip = clientIp(req, sock);
+  if (ip === null) { refuse(sock, 400, "Bad Request", "invalid proxy address chain"); return; }
   if (sockets.size >= MAX_CONNECTIONS) {
     refuse(sock, 503, "Service Unavailable", `at capacity (${sockets.size} conns)`);
     return;
   }
   if ((ipCounts.get(ip) ?? 0) >= MAX_CONNS_PER_IP) {
-    refuse(sock, 429, "Too Many Requests", `per-ip cap (${ip})`);
+    refuse(sock, 429, "Too Many Requests", "per-ip cap");
     return;
   }
   const existingRoom = rooms.get(room);
@@ -239,8 +327,8 @@ server.on("upgrade", (req, sock) => {
     refuse(sock, 429, "Too Many Requests", `room table full (${rooms.size} rooms)`);
     return;
   }
-  if (existingRoom && existingRoom.size >= MAX_CONNS_PER_ROOM) {
-    refuse(sock, 429, "Too Many Requests", `room ${room} full (${existingRoom.size})`);
+  if ((existingRoom?.size ?? 0) >= MAX_CONNS_PER_ROOM) {
+    refuse(sock, 429, "Too Many Requests", "room full");
     return;
   }
 
@@ -253,12 +341,15 @@ server.on("upgrade", (req, sock) => {
   );
 
   const roomSet = joinRoom(room, sock);
+  clearTimeout(sock._relayHandshakeTimer);
   sock._relayRoom = room;
   sock._relayIp = ip;
   sock._relayAlive = true;                // cleared each heartbeat, set on pong
   sockets.add(sock);
   ipCounts.set(ip, (ipCounts.get(ip) ?? 0) + 1);
-  console.log(`+ client room=${room} (${roomSet.size} in room, ${rooms.size} rooms, ${sockets.size} total)`);
+  console.log(`+ client (${roomSet.size} in room, ${rooms.size} rooms, ${sockets.size} total)`);
+  const byteBudget = bucket(256 * 1024);
+  const frameBudget = bucket(128);
 
   // Chunk buffer: a list of incoming Buffers + the total bytes pending.
   // We only Buffer.concat when we have at least enough bytes to parse the
@@ -302,7 +393,11 @@ server.on("upgrade", (req, sock) => {
     return Buffer.concat(collected).subarray(0, n);
   }
 
-  sock.on("data", (chunk) => {
+  const onData = (chunk) => {
+    if (sock.destroyed) return;
+    if (!spend(byteBudget, chunk.length) || !spend(incomingBytes, chunk.length)) {
+      sock.destroy(); return;
+    }
     chunks.push(chunk);
     chunkTotal += chunk.length;
 
@@ -316,13 +411,17 @@ server.on("upgrade", (req, sock) => {
       // A FIN=0 frame would be repacked as FIN=1 by encodeFrame below,
       // changing the semantics on the wire — better to refuse outright.
       const fin = (header[0] & 0x80) !== 0;
-      if (!fin) {
-        console.log("! dropped: fragmented frame (FIN=0)");
+      if (!fin || (header[0] & 0x70) !== 0) {
+        console.log("! dropped: fragmentation or reserved frame bits");
         sock.destroy();
         return;
       }
 
       const opcode = header[0] & 0x0f;
+      if (![1, 2, 8, 9, 10].includes(opcode) ||
+          (opcode >= 8 && (header[1] & 0x7f) > 125)) {
+        sock.destroy(); return;
+      }
       const masked = (header[1] & 0x80) !== 0;
       // Per RFC 6455 client→server frames MUST be masked.
       if (!masked) {
@@ -337,6 +436,7 @@ server.on("upgrade", (req, sock) => {
         const ext = peek(4);
         if (!ext) break;
         payloadLen = ext.readUInt16BE(2);
+        if (payloadLen < 126) { sock.destroy(); return; }
         headerLen = 4;
       } else if (payloadLen === 127) {
         const ext = peek(10);
@@ -349,6 +449,7 @@ server.on("upgrade", (req, sock) => {
           return;
         }
         payloadLen = Number(big);
+        if (payloadLen < 65536) { sock.destroy(); return; }
         headerLen = 10;
       }
       if (payloadLen > MAX_FRAME_PAYLOAD) {
@@ -360,6 +461,9 @@ server.on("upgrade", (req, sock) => {
       const totalFrame = headerLen + 4 + payloadLen; // +4 mask
       const full = peek(totalFrame);
       if (!full) break;                              // wait for more bytes
+      if (!spend(frameBudget, 1) || !spend(incomingFrames, 1)) {
+        sock.destroy(); return;
+      }
 
       const mask = full.subarray(headerLen, headerLen + 4);
       const masked_payload = full.subarray(headerLen + 4, totalFrame);
@@ -374,32 +478,33 @@ server.on("upgrade", (req, sock) => {
       // and broadcasting buffered frames off a socket we just ended/destroyed.
       if (!handleFrame(opcode, payload)) return;
     }
-  });
+  };
+  sock.on("data", onData);
 
   // Returns true to keep draining buffered frames, false once the socket has
   // been torn down (close opcode or invalid frame) so the caller stops.
   function handleFrame(opcode, payload) {
-    if (opcode === 0x8) { sock.end(); return false; }        // close
+    if (opcode === 0x8) { sock.destroy(); return false; }   // close
     if (opcode === 0x9) {                                     // ping → pong
-      try { sock.write(encodeFrame(0xA, payload)); } catch {}
-      return true;
+      return writeFrame(sock, encodeFrame(0xA, payload));
     }
     if (opcode === 0xA) { sock._relayAlive = true; return true; }  // pong → still alive
     if (opcode === 0x1 || opcode === 0x2) {                   // text/binary
+      if (opcode === 0x1 && !isUtf8(payload)) { sock.destroy(); return false; }
       const out = encodeFrame(opcode, payload);
       // Broadcasts stay inside the sender's room. A client in room "alpha"
       // never sees frames from room "beta"; the relay does no other routing.
       const peers = rooms.get(sock._relayRoom);
       if (!peers) return true;
+      const recipients = peers.size - 1;
+      if (!spend(peers.bytes, out.length * recipients) || !spend(peers.frames, recipients) ||
+          !spend(outgoingBytes, out.length * recipients) || !spend(outgoingFrames, recipients)) {
+        sock.destroy(); return false;
+      }
       for (const other of peers) {
         if (other === sock) continue;
         if (!other.writable) continue;
-        // V2 backpressure: skip clients with a fat outbound queue rather
-        // than letting it grow without limit. They'll catch up on their
-        // own writes; missing one broadcast is benign (signaling is
-        // best-effort, peers retry).
-        if (other.writableLength > MAX_SOCKET_BACKLOG) continue;
-        try { other.write(out); } catch { /* swallow */ }
+        writeFrame(other, out);
       }
       return true;
     }
@@ -423,11 +528,13 @@ server.on("upgrade", (req, sock) => {
     const r = sock._relayRoom;
     if (r !== undefined) {
       const remaining = leaveRoom(r, sock);
-      console.log(`- client room=${r} (${remaining} in room, ${rooms.size} rooms, ${sockets.size} total)`);
+      console.log(`- client (${remaining} in room, ${rooms.size} rooms, ${sockets.size} total)`);
     }
   };
   sock.on("close", drop);
   sock.on("error", drop);
+  // Node may deliver the first frame with the HTTP upgrade request.
+  if (head?.length) onData(head);
 });
 
 // Encode a server→client frame (unmasked per RFC 6455).
@@ -464,14 +571,14 @@ if (HEARTBEAT_MS > 0) {
     for (const sock of sockets) {
       if (sock._relayAlive === false) { sock.destroy(); continue; }
       sock._relayAlive = false;
-      try { sock.write(PING); } catch { /* swallow; reaped next sweep */ }
+      writeFrame(sock, PING);
     }
   }, HEARTBEAT_MS);
   beat.unref();  // a pending ping timer alone shouldn't keep the process alive
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`SeedKernel signaling relay listening on ws://${HOST}:${PORT}/<room>`);
+  console.log(`SeedKernel signaling relay listening on ws://${HOST}:${server.address().port}/<room>`);
   console.log(`  origin allowlist: ${[...ALLOWED_ORIGINS].slice(0, 4).join(", ")}…`);
   console.log(`  frame cap: ${MAX_FRAME_PAYLOAD} B  socket backlog cap: ${MAX_SOCKET_BACKLOG} B`);
   console.log(`  rooms: any path component (chars [A-Za-z0-9._-], up to ${MAX_ROOM_NAME}); bare "/" = "${DEFAULT_ROOM}"`);

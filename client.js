@@ -4,6 +4,10 @@
 // the application; this module owns only serialization, queuing, and socket turnover.
 
 const OPEN = 1;
+const MAX_MESSAGE_BYTES = 64 * 1024;
+const MAX_BUFFER_BYTES = 256 * 1024;
+const MAX_PENDING_MESSAGES = 256;
+const utf8 = new TextEncoder();
 
 /**
  * @param {{
@@ -29,10 +33,43 @@ export function createRelaySignaling(options = {}) {
   let currentUrl = null;
   let receive = () => {};
   const pending = [];
+  let pendingBytes = 0;
+  let flushTimer = null;
+
+  function clearPending() {
+    pending.length = 0;
+    pendingBytes = 0;
+  }
+  function stopFlush() {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  function flush() {
+    stopFlush();
+    const next = socket;
+    if (next?.readyState !== OPEN) return;
+    while (pending.length > 0) {
+      const item = pending[0];
+      if ((next.bufferedAmount ?? 0) + item.bytes > MAX_BUFFER_BYTES) break;
+      try { next.send(item.encoded); }
+      catch { disconnect(); return; }
+      pending.shift();
+      pendingBytes -= item.bytes;
+    }
+    if (pending.length > 0) {
+      flushTimer = setTimeout(flush, 25);
+      flushTimer.unref?.();
+    }
+  }
 
   const emit = (state, event) => onStateChange({ state, url: currentUrl, event });
 
   function replaceSocket(url) {
+    stopFlush();
+    // The first URL owns pre-connect messages. Later destination changes
+    // discard them even when creation of the replacement socket fails.
+    if (currentUrl !== null && currentUrl !== url) clearPending();
+    currentUrl = url;
     const previous = socket;
     socket = null;
     socketGeneration++;
@@ -48,19 +85,18 @@ export function createRelaySignaling(options = {}) {
     }
     const generation = socketGeneration;
     socket = next;
-    currentUrl = url;
 
     next.addEventListener("open", (event) => {
       if (socket !== next || socketGeneration !== generation) return;
-      while (pending.length > 0) {
-        try { next.send(pending[0]); }
-        catch { break; }
-        pending.shift();
-      }
+      flush();
+      if (socket !== next) return;
       emit("connected", event);
     });
     next.addEventListener("message", (event) => {
       if (socket !== next || socketGeneration !== generation || typeof event.data !== "string") return;
+      if (event.data.length > MAX_MESSAGE_BYTES || utf8.encode(event.data).length > MAX_MESSAGE_BYTES) {
+        disconnect(); return;
+      }
       let message;
       try { message = JSON.parse(event.data); }
       catch { return; }
@@ -68,6 +104,7 @@ export function createRelaySignaling(options = {}) {
     });
     next.addEventListener("close", (event) => {
       if (socket !== next || socketGeneration !== generation) return;
+      stopFlush();
       socket = null;
       emit("disconnected", event);
     });
@@ -80,6 +117,7 @@ export function createRelaySignaling(options = {}) {
   }
 
   function disconnect() {
+    stopFlush();
     const previous = socket;
     socket = null;
     socketGeneration++;
@@ -94,8 +132,17 @@ export function createRelaySignaling(options = {}) {
       const encoded = JSON.stringify(message);
       if (typeof encoded !== "string")
         throw new TypeError("seedrelay: signaling message is not JSON-serializable");
-      if (socket?.readyState === OPEN) socket.send(encoded);
-      else pending.push(encoded);
+      if (encoded.length > MAX_MESSAGE_BYTES)
+        throw new RangeError("seedrelay: signaling message exceeds 64 KiB");
+      const bytes = utf8.encode(encoded).length;
+      if (bytes > MAX_MESSAGE_BYTES)
+        throw new RangeError("seedrelay: signaling message exceeds 64 KiB");
+      if (pending.length >= MAX_PENDING_MESSAGES ||
+          pendingBytes + bytes + (socket?.bufferedAmount ?? 0) > MAX_BUFFER_BYTES)
+        throw new RangeError("seedrelay: signaling buffer is full");
+      pending.push({ encoded, bytes });
+      pendingBytes += bytes;
+      flush();
     },
     onMessage(callback) {
       if (typeof callback !== "function")
@@ -104,7 +151,7 @@ export function createRelaySignaling(options = {}) {
     },
     close() {
       disconnect();
-      pending.length = 0;
+      clearPending();
       currentUrl = null;
     },
   };
