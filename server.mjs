@@ -28,8 +28,9 @@
 // No third-party dependencies.
 //
 // Run: seedrelay [port] [options]  (or: node server.mjs)
+//   --port N               port to listen on (default 8080; a bare number works too)
 //   --host HOST            interface to bind (default 127.0.0.1)
-//   --allow-origin ORIGIN  add an allowed Origin (repeatable)
+//   --allow-origin ORIGIN  allow this Origin (repeatable; replaces the localhost defaults)
 //   --max-conns N          total concurrent sockets        (env RELAY_MAX_CONNS)
 //   --max-rooms N          total concurrent rooms          (env RELAY_MAX_ROOMS)
 //   --max-per-room N       sockets per room                (env RELAY_MAX_PER_ROOM)
