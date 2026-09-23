@@ -22,7 +22,7 @@
 // The relay is intentionally dumb: every frame from one client is forwarded
 // verbatim to every other connected client in the same room. Signaling
 // messages carry `from` / `to` peer-id fields so clients can filter; the
-// relay itself does not inspect them. SeedKernel signatures and trust are
+// relay itself does not inspect them. Seedkernel signatures and trust are
 // still verified end-to-end inside each peer's kernel pipeline.
 //
 // No third-party dependencies.
@@ -579,7 +579,7 @@ if (HEARTBEAT_MS > 0) {
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`SeedKernel signaling relay listening on ws://${HOST}:${server.address().port}/<room>`);
+  console.log(`seedrelay listening on ws://${HOST}:${server.address().port}/<room>`);
   console.log(`  origin allowlist: ${[...ALLOWED_ORIGINS].slice(0, 4).join(", ")}…`);
   console.log(`  frame cap: ${MAX_FRAME_PAYLOAD} B  socket backlog cap: ${MAX_SOCKET_BACKLOG} B`);
   console.log(`  rooms: any path component (chars [A-Za-z0-9._-], up to ${MAX_ROOM_NAME}); bare "/" = "${DEFAULT_ROOM}"`);

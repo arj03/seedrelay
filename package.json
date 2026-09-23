@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "App-neutral WebSocket rendezvous and reconnectable signaling client for SeedKernel WebRTC meshes.",
+  "description": "App-neutral WebSocket rendezvous and reconnectable signaling client for seedkernel WebRTC meshes.",
   "exports": {
     ".": "./client.js"
   },
