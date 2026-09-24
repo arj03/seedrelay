@@ -1,17 +1,15 @@
-# seedrelay — a signaling relay for [seedkernel](https://github.com/arj03/seedkernel)
+# seedrelay: a signaling relay for [seedkernel](https://github.com/arj03/seedkernel)
 
 The app-neutral rendezvous for seedkernel WebRTC meshes. Peers meet in a **room** on
-the relay, exchange SDP offers/answers and ICE candidates as JSON, then open
-peer-to-peer data channels and stop needing the relay. Once every pair of active
+the relay, exchange SDP offers/answers and ICE candidates, then open peer-to-peer
+data channels and stop needing the relay. Once every pair of active
 peers is linked, the relay can be killed without disrupting traffic; it only matters
 for adding new peers.
 
-The package holds the two pieces that must agree on that JSON-over-WebSocket hop:
-
-- **`server.mjs`**, a bounded WebSocket broadcast server partitioned by room, with no
-  third-party dependencies.
-- **`client.js`**, a reconnectable adapter exposing the `Signaling` seam that
-  seedkernel's `RtcNetwork` consumes.
+The package is one piece: **`server.mjs`**, a bounded WebSocket broadcast server
+partitioned by room, with no third-party dependencies. The other end is the seedkernel
+transport bundle, which joins a room and speaks its own signaling frames through it
+(seedkernel §12.7), so there is no client library to install.
 
 The relay is deliberately dumb: every frame from one client is forwarded verbatim to
 every other client in the same room. It carries only peer discovery, SDP and ICE, and
@@ -23,10 +21,10 @@ never impersonate a peer.
 This lives outside the seedkernel repo because a relay is a deployment concern, not
 trusted runtime surface: the kernel ships no server, and its own tests signal
 in-process. [seedchat](https://github.com/arj03/seedchat) and
-[seedstore](https://github.com/arj03/seedstore) both consume this package.
+[seedstore](https://github.com/arj03/seedstore) both use it.
 
 **Contents:** [Quick start](#quick-start) · [Running the server](#running-the-server) ·
-[Deploying publicly](#deploying-publicly) · [Using the client](#using-the-client) ·
+[Deploying publicly](#deploying-publicly) · [Joining a room](#joining-a-room) ·
 [What's here](#whats-here) · [Troubleshooting](#troubleshooting)
 
 ## Quick start
@@ -35,8 +33,9 @@ in-process. [seedchat](https://github.com/arj03/seedchat) and
 
 - **Node.js ≥ 20.** There are no runtime dependencies.
 
-Apps depend on seedrelay as a sibling checkout through a `file:` dependency
-(`"seedrelay": "file:../seedrelay"`), so the usual layout is:
+An app that starts the relay from its own scripts depends on seedrelay as a sibling
+checkout through a `file:` dependency (`"seedrelay": "file:../seedrelay"`), so the usual
+layout is:
 
 ```
 some-dir/
@@ -63,7 +62,7 @@ npx seedrelay 8080
 | Script | What it does |
 | --- | --- |
 | `npm run start` | Starts the relay (`node server.mjs`). Arguments after `--` are passed through. |
-| `npm test` | Runs the server and client tests with `node --test`. |
+| `npm test` | Runs the server tests with `node --test`. |
 
 ## Running the server
 
@@ -176,66 +175,34 @@ clients count toward the per-address cap immediately. Trusted proxies share only
 global cap at that stage, and each forwarded client is held to the per-address cap
 once its headers arrive. Apply connection and request limits at the proxy as well.
 
-## Using the client
+## Joining a room
+
+A seedkernel node joins through its transport bundle's host-only `relay` operation,
+naming the room URL; the transport opens the WebSocket itself, says hello, and
+connects the peers it meets there (seedkernel §12.6, §12.7). An embedder supplies only
+the sockets: a factory that can reach the relay and seedkernel's `RtcNetwork` for the
+peer connections.
 
 ```js
-import { createRelaySignaling } from "seedrelay";
+import { WsNetwork } from "seedkernel-wasm/net-ws";
 import { RtcNetwork } from "seedkernel-wasm/net-rtc";
+import { combineChannels } from "seedkernel-wasm/socket-seam";
+import { OpArgs } from "seedkernel-wasm/op-frame";
 
-const relay = createRelaySignaling({
-  onStateChange: ({ state }) => updateNetworkUi(state),
-});
-
-const network = new RtcNetwork({ driver, signaling: relay.signaling });
-relay.connect("wss://relay.example/my-room");
-network.join();
+const { shell } = await bootShell({ /* … */ transport: { channels: combineChannels(new WsNetwork(), new RtcNetwork()) } });
+await shell.call("_net", new OpArgs("relay").text("wss://relay.example/my-room").build());
 ```
 
-`createRelaySignaling(options?)` takes:
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `webSocketFactory` | `(url) => new WebSocket(url)` | Builds each socket, e.g. to supply a WebSocket implementation outside the browser. |
-| `onStateChange` | no-op | Called with `{ state, url, event? }`, where `state` is `"connecting"`, `"connected"`, `"disconnected"` or `"error"`. |
-
-It returns:
-
-| Member | Meaning |
-| --- | --- |
-| `signaling` | The `Signaling` object (`send`, `onMessage`, `close`) to hand to `RtcNetwork`. It stays the same across `connect()` calls. |
-| `connect(url)` | Closes any current socket and opens one to `url`. Returns the new socket. |
-| `disconnect()` | Closes the current socket and keeps queued messages. |
-
-The client owns only serialization, queuing and socket turnover. Picking the URL and
-room, reconnecting, and any UI stay with the application.
-
-### Queuing
-
-Messages sent while disconnected are queued for reconnection to the same URL, and
-`disconnect()` keeps that queue. Connecting to a different URL discards it, even when
-the replacement socket fails to open. Messages sent before the first `connect()`
-belong to that first destination. Closing the `Signaling`, normally through
-`RtcNetwork.close()`, discards the queue.
-
-### Backpressure
-
-Outgoing JSON is limited to 64 KiB per message, 256 queued messages, and 256 KiB of
-queued UTF-8 bytes plus the socket's `bufferedAmount`. `send()` throws `RangeError`
-when a limit would be exceeded; treat that as backpressure and retry with backoff.
-Queued messages flush in order as capacity allows. A custom `webSocketFactory` should
-report an accurate `bufferedAmount` for this to bound transport buffering.
-
-Incoming text larger than 64 KiB disconnects the adapter. Binary frames and text that
-is not valid JSON are ignored.
+The transport redials a relay that drops, and its `relayState` operation reports
+whether the link is up. Frames are binary, UTF-8 inside, and at most 64 KiB, well within
+the relay's frame cap.
 
 ## What's here
 
 | Path | What it is |
 | --- | --- |
 | `server.mjs` | The relay server and the `seedrelay` bin. The option list is also in its header comment. |
-| `client.js` | `createRelaySignaling`, the package's only export. |
 | `test/server.test.mjs` | Drives the server with fake sockets: frame validation, backlog caps, origins, proxy trust, connection caps, traffic budgets and log redaction. |
-| `test/client.test.mjs` | Drives the adapter with fake sockets: queuing, reconnects, URL changes, backpressure and incoming size limits. |
 
 ## Troubleshooting
 
@@ -258,6 +225,3 @@ is not valid JSON are ignored.
   `--trusted-proxy`.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,
   exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff.
-- **`send()` throws `RangeError: seedrelay: signaling buffer is full`.** The queue is
-  at its cap, usually because the socket is not open. Retry with backoff once
-  `onStateChange` reports `connected`.

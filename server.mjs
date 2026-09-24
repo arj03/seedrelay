@@ -1,14 +1,14 @@
-// Minimal WebSocket broadcast hub — the app-neutral signaling rendezvous for the
-// kernel's RtcNetwork (seedkernel `host/net-rtc.ts`, §12.7). It lives in seedrelay
-// because it is a deployment concern, not trusted runtime surface: the kernel ships
-// no server and its own tests signal in-process. Seedchat and seedstore both consume
-// this package.
+// Minimal WebSocket broadcast hub — the app-neutral signaling rendezvous for
+// seedkernel's WebRTC meshes (§12.7). The seedkernel transport bundle joins a room
+// here and speaks its own signaling frames through it. It lives in seedrelay because
+// it is a deployment concern, not trusted runtime surface: the kernel ships no server
+// and its own tests signal in-process. Seedchat and seedstore both use it.
 //
-// Used only as a WebRTC signaling rendezvous: clients exchange JSON SDP
-// offers / answers and ICE candidates here, then open RTCDataChannels to
-// each other and route kernel envelopes peer-to-peer. Once every pair of
-// active peers has an open DataChannel, this process can be killed without
-// disrupting traffic — it only matters for adding new peers.
+// Used only as a WebRTC signaling rendezvous: peers exchange SDP offers /
+// answers and ICE candidates here, then open RTCDataChannels to each other
+// and route kernel envelopes peer-to-peer. Once every pair of active peers
+// has an open DataChannel, this process can be killed without disrupting
+// traffic — it only matters for adding new peers.
 //
 // Clients pick a "room" by connecting to ws://host:port/<room>. Broadcasts
 // are scoped to the room: a frame from a client in room "alpha" reaches
