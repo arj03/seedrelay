@@ -224,6 +224,15 @@ a trusted connection with a missing or malformed chain is refused.
 Trust only proxies you control. IP trust cannot tell apart processes sharing an
 address, so block direct access to the backend port.
 
+**Serve plain `ws://` too.** Browsers on HTTPS pages need `wss://`, but console nodes
+(seedkernel's CLI on Node or the native binary) have no TLS and dial `ws://` only. Have
+the proxy forward port 80 to the same relay as 443, so both reach one relay and meet in
+the same rooms. Registration still matches: a node dialing `ws://relay.example` signs
+`relay.example`, the `Host` the proxy forwards. A splice's traffic is encrypted end to
+end either way; over `ws://` an observer sees the room name, the room's keys and who
+calls whom, so a console node that needs a private room should reach its peers by key,
+through `/`, instead.
+
 Connection accounting starts at the TCP level, before HTTP headers arrive. Direct
 clients count toward the per-address cap immediately. Trusted proxies share only the
 global cap at that stage, and each forwarded client is held to the per-address cap
