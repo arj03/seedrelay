@@ -87,7 +87,8 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--max-rooms N` | `RELAY_MAX_ROOMS` | `512` | Concurrent rooms. |
 | `--max-per-room N` | `RELAY_MAX_PER_ROOM` | `64` | Sockets per room. |
 | `--max-per-ip N` | `RELAY_MAX_PER_IP` | `64` | Sockets per client address, splice sockets included. |
-| `--max-splices N` | `RELAY_MAX_SPLICES` | `1024` | Splices joined or waiting for their sockets. |
+| `--max-per-room-ip N` | `RELAY_MAX_PER_ROOM_IP` | `16` | Sockets one client address may hold in one room. |
+| `--splice-rate N` | `RELAY_SPLICE_RATE` | `1024` | KiB/s one client address may send through its splices; `0` leaves them unmetered. |
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
 | `--trust-proxy` | `RELAY_TRUST_PROXY=1` | | Legacy. Now fails at startup unless trusted proxy addresses are also given. |
@@ -132,12 +133,14 @@ seedkernel identities, tickets 16 random bytes chosen by the caller.
 - **Rooms.** A registered socket in a room gets the room's other keys once, then
   `joined` and `left` as keys come and go. Two sockets with one key are one member.
 - **Calls.** `call` sends `incoming` to the callee's socket only, or answers
-  `unreachable` when the key is not registered here, is the caller's own, or the ticket
-  is in use. Both ends then open `/?splice=<ticket>`, and the relay joins them once
-  both are there, or drops them after 10 seconds.
+  `unreachable` when the key is not registered here, is the caller's own, the ticket is
+  in use, or the caller's address has too many calls waiting (see [Limits](#limits)).
+  Both ends then open `/?splice=<ticket>`, and the relay joins them once both are there,
+  or drops them after 10 seconds.
 - **Splices.** Data frames are streamed through unmasked, whatever their size or
   fragmentation, so the relay holds a chunk, never a whole message. Ping and pong stay on
-  each hop, and a close ends both ends. A full receiver pauses the sender.
+  each hop, and a close ends both ends. A full receiver, or a sender past its
+  address's budget, pauses the sender.
 
 Rooms are not authenticated: **a room name is a bearer credential** for learning which
 keys are in it. For a private room, use at least 16 random bytes encoded as hex. The
@@ -175,9 +178,17 @@ Control sockets carry a few small frames each; splices carry the traffic.
   instead.
 - **Handshakes** must complete within 10 seconds of the TCP connection, however
   slowly the input trickles in, and registration within 10 seconds of the upgrade.
-- **Splices.** `--max-splices` (`RELAY_MAX_SPLICES`, default 1024) caps splices joined
-  or waiting, and one control socket may have as many calls waiting as a room has
-  members. A splice's bandwidth is not metered; cap it at a proxy if it has to be.
+- **Calls** are charged to the caller's address, not to a table everyone shares: it may
+  have as many waiting as a room has seats (`--max-per-room`), at most 8 of them to any
+  one key, since each makes the callee open a socket. A joined splice holds two sockets,
+  which the socket caps bound.
+- **Splices** are metered per client address: what an address sends through its
+  splices, `--splice-rate` KiB/s (`RELAY_SPLICE_RATE`, default 1024) with two seconds of
+  burst. Past it, that address's splice sockets are not read until the debt is paid
+  back, so a sender is slowed, not disconnected. Without this, anyone holding two keys
+  could splice them together and use the relay as an unmetered pipe.
+- **Rooms.** One address may hold `--max-per-room-ip` sockets (default 16) in a room, so
+  a single address cannot fill a public room.
 - **Traffic** on control sockets is metered by token buckets with two seconds of burst
   allowance. Announcing a room member counts every recipient.
 
@@ -190,7 +201,8 @@ Control sockets carry a few small frames each; splices carry the traffic.
 
 Exceeding a traffic budget disconnects the sender; clients should reconnect with
 backoff. Connection caps are refused before the protocol switch, with `503` when the
-relay is full and `429` for per-address, per-room and room-table caps. These limits
+relay is full and `429` for the per-address, per-room, per-address-in-a-room and
+room-table caps. These limits
 bound abuse but do not protect availability against a distributed denial of service.
 
 ## Deploying publicly
@@ -270,5 +282,7 @@ whether it is registered.
 - **A node never registers.** The relay logs `! dropped: bad registration`: the node
   signed for another authority than the `Host` the relay saw, which happens when a
   proxy rewrites `Host`. Forward the original `Host`.
-- **A call comes back unreachable.** The callee is not registered on this relay, or
-  the splice table (`--max-splices`) is full.
+- **A call comes back unreachable.** The callee is not registered on this relay, or the
+  caller's address already has a room's worth of calls waiting, or 8 to that key.
+- **Relayed traffic is slow.** The sending address is past `--splice-rate`; raise it,
+  or `0` to leave splices unmetered.

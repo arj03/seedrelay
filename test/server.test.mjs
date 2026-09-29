@@ -58,8 +58,8 @@ function fixture(args = []) {
   }
   const join = (options, address) => upgrade(tcp(address), options);
   /** A control socket that has registered `id` (a fresh one by default). */
-  function member(options = {}, id = identity()) {
-    const s = join(options);
+  function member(options = {}, id = identity(), address) {
+    const s = join(options, address);
     s.emit("data", frame(2, registration(id, "relay.test", challenge(s))));
     s.id = id;
     return s;
@@ -248,14 +248,47 @@ test("one end closing ends the other, and an unjoined ticket expires", () => {
   assert.equal(lone.destroyed, true, "the ticket expired with the first join's clock");
 });
 
-test("splices are capped per relay and per caller", () => {
-  const f = fixture(["--max-splices", "2"]), a = f.member(), b = f.member();
-  for (let i = 0; i < 3; i++) a.emit("data", call(b.id.pk, randomBytes(16)));
-  assert.equal(typed(b).filter((p) => p[0] === 0x05).length, 2);
-  assert.equal(typed(a).at(-1)[0], 0x06, "the table is full");
-  const g = fixture(["--max-per-room", "2"]), c = g.member(), d = g.member();
-  for (let i = 0; i < 3; i++) c.emit("data", call(d.id.pk, randomBytes(16)));
-  assert.equal(typed(c).at(-1)[0], 0x06, "one caller has too many calls waiting");
+test("waiting calls are charged to the caller's address, at most eight to one key", () => {
+  const f = fixture(), a = f.member(), b = f.member();
+  const rings = () => typed(b).filter((p) => p[0] === 0x05).length;
+  for (let i = 0; i < 9; i++) a.emit("data", call(b.id.pk, randomBytes(16)));
+  assert.equal(rings(), 8);
+  assert.equal(typed(a).at(-1)[0], 0x06, "a ninth call to one key from one address is unreachable");
+  f.member({}, identity(), "192.0.2.7").emit("data", call(b.id.pk, randomBytes(16)));
+  assert.equal(rings(), 9, "another address still gets through");
+
+  const g = fixture(["--max-per-room", "2"]), c = g.member(), d = g.member(), e = g.member({ path: "/" });
+  c.emit("data", call(d.id.pk, randomBytes(16)));
+  e.emit("data", call(d.id.pk, randomBytes(16)));
+  c.emit("data", call(e.id.pk, randomBytes(16)));
+  assert.equal(typed(c).at(-1)[0], 0x06, "the address has a room's worth of calls waiting, over all its sockets");
+  g.advance(10_000);
+  c.emit("data", call(e.id.pk, randomBytes(16)));
+  assert.equal(typed(e).at(-1)[0], 0x05, "calls that expired are given back");
+});
+
+test("one address takes only a few of a room's seats", () => {
+  const f = fixture(["--max-per-room-ip", "2"]);
+  assert.equal(f.join().destroyed, false);
+  assert.equal(f.join().destroyed, false);
+  assert.equal(f.join().destroyed, true, "a third socket from the address is refused");
+  assert.equal(f.join({}, "192.0.2.7").destroyed, false, "another address still fits");
+  assert.equal(f.join({ room: "other" }).destroyed, false, "and the address fits in another room");
+});
+
+test("splice traffic is metered per address: past its budget a sender is paused, not cut", () => {
+  const f = fixture(["--splice-rate", "1"]), a = f.member(), b = f.member(), ticket = randomBytes(16);
+  a.emit("data", call(b.id.pk, ticket));
+  const path = `/?splice=${ticket.toString("hex")}`;
+  const sa = f.join({ path }), sb = f.join({ path });
+  sa.emit("data", frame(2, randomBytes(1024)));
+  assert.equal(sa.paused, false, "within the two-second burst");
+  sa.emit("data", frame(2, randomBytes(2048)));
+  assert.equal(sa.paused, true, "past it, the sender is not read");
+  assert.equal(sa.destroyed, false);
+  assert.equal(serverFrames(sb).length, 2, "what it sent was forwarded");
+  f.advance(2000);
+  assert.equal(sa.paused, false, "read again once the debt is paid back");
 });
 
 test("invalid control sizes, RSV, fragmentation, masking and lengths are rejected", () => {
@@ -354,7 +387,7 @@ test("frame and input byte floods disconnect their sender", () => {
 });
 
 test("join announcements are charged to the room and refill over time", () => {
-  const f = fixture(["--max-per-room", "200", "--max-per-ip", "1000"]);
+  const f = fixture(["--max-per-room", "200", "--max-per-ip", "1000", "--max-per-room-ip", "1000"]);
   const peers = [];
   while (peers.length < 200 && !peers.at(-1)?.destroyed) peers.push(f.member());
   assert.equal(peers.at(-1).destroyed, true, "a room that cannot afford the fan-out refuses the joiner");

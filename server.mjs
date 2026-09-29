@@ -25,7 +25,8 @@
 // its control socket, the relay passes the ticket to the callee's control socket only,
 // and both ends open a splice socket with it. The relay joins the first two sockets
 // presenting a ticket, and refuses one nobody called, so two strangers cannot use it as
-// a free pipe.
+// a pipe. One party holding two keys can, so what splices carry is metered per client
+// address.
 //
 // No third-party dependencies.
 //
@@ -37,7 +38,9 @@
 //   --max-rooms N          total concurrent rooms          (env RELAY_MAX_ROOMS)
 //   --max-per-room N       sockets per room                (env RELAY_MAX_PER_ROOM)
 //   --max-per-ip N         sockets per client address      (env RELAY_MAX_PER_IP)
-//   --max-splices N        splices joined or waiting       (env RELAY_MAX_SPLICES)
+//   --max-per-room-ip N    sockets per address in one room (env RELAY_MAX_PER_ROOM_IP)
+//   --splice-rate N        KiB/s an address sends through splices, 0=unmetered
+//                                                          (env RELAY_SPLICE_RATE)
 //   --heartbeat-secs N     ping/reap interval, 0=off       (env RELAY_HEARTBEAT_SECS)
 //   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
 //   --trust-proxy          legacy flag; requires explicit trusted proxy addresses
@@ -66,7 +69,8 @@ let MAX_CONNECTIONS    = num(process.env.RELAY_MAX_CONNS,        1024);
 let MAX_ROOMS          = num(process.env.RELAY_MAX_ROOMS,         512);
 let MAX_CONNS_PER_ROOM = num(process.env.RELAY_MAX_PER_ROOM,       64);
 let MAX_CONNS_PER_IP   = num(process.env.RELAY_MAX_PER_IP,         64);
-let MAX_SPLICES        = num(process.env.RELAY_MAX_SPLICES,      1024);
+let MAX_PER_ROOM_IP    = num(process.env.RELAY_MAX_PER_ROOM_IP,    16);
+let SPLICE_RATE        = num(process.env.RELAY_SPLICE_RATE,      1024);
 let HEARTBEAT_MS       = num(process.env.RELAY_HEARTBEAT_SECS,     30) * 1000;
 let TRUST_PROXY        = process.env.RELAY_TRUST_PROXY === "1";
 const TRUSTED_PROXIES = new Set();
@@ -99,7 +103,8 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--max-rooms") { MAX_ROOMS = num(args[++i], MAX_ROOMS); }
   else if (a === "--max-per-room") { MAX_CONNS_PER_ROOM = num(args[++i], MAX_CONNS_PER_ROOM); }
   else if (a === "--max-per-ip") { MAX_CONNS_PER_IP = num(args[++i], MAX_CONNS_PER_IP); }
-  else if (a === "--max-splices") { MAX_SPLICES = num(args[++i], MAX_SPLICES); }
+  else if (a === "--max-per-room-ip") { MAX_PER_ROOM_IP = num(args[++i], MAX_PER_ROOM_IP); }
+  else if (a === "--splice-rate") { SPLICE_RATE = num(args[++i], SPLICE_RATE); }
   else if (a === "--heartbeat-secs") { HEARTBEAT_MS = num(args[++i], HEARTBEAT_MS / 1000) * 1000; }
   else if (a === "--trust-proxy") { TRUST_PROXY = true; }
   else if (a === "--trusted-proxy") { trustProxy(args[++i] ?? ""); }
@@ -310,19 +315,30 @@ function unregister(sock) {
 //
 // A call creates its ticket in `pending`, where it waits for both of its
 // sockets and is joined once they are there. It expires unjoined after
-// SPLICE_WAIT_MS. `pending` and the joined pairs share MAX_SPLICES, and one
-// control socket may have MAX_CONNS_PER_ROOM calls waiting, enough to call a
-// whole room at once.
+// SPLICE_WAIT_MS. Waiting calls are charged to the caller's address, not to a
+// table everyone shares: as many as a room has seats, enough to call a whole
+// room at once, and at most MAX_CALLS_PER_CALLEE for any one key, since every
+// call makes its callee open a socket here. A joined splice holds two sockets,
+// which the socket caps bound.
+const MAX_CALLS_PER_CALLEE = 8;
 const pending = new Map();
-let joinedSplices = 0;
+const callsFrom = new Map(); // caller address to its calls waiting
+const callsTo = new Map();   // caller address and callee key to the calls waiting between them
 
-function pendingSplice(ticket, caller) {
-  if (pending.has(ticket) || pending.size + joinedSplices >= MAX_SPLICES) return null;
-  if ((caller._relayCalls ?? 0) >= MAX_CONNS_PER_ROOM) return null;
-  const s = { ticket, caller, socks: [], timer: null };
+function bump(map, key, by) {
+  const n = (map.get(key) ?? 0) + by;
+  if (n > 0) map.set(key, n); else map.delete(key);
+}
+
+function pendingSplice(ticket, caller, callee) {
+  const from = caller._relayIp, pair = `${from} ${callee}`;
+  if (pending.has(ticket) || (callsFrom.get(from) ?? 0) >= MAX_CONNS_PER_ROOM ||
+      (callsTo.get(pair) ?? 0) >= MAX_CALLS_PER_CALLEE) return null;
+  const s = { ticket, from, pair, socks: [], timer: null };
   s.timer = setTimeout(() => expireSplice(s), SPLICE_WAIT_MS);
   s.timer.unref?.();
-  caller._relayCalls = (caller._relayCalls ?? 0) + 1;
+  bump(callsFrom, from, 1);
+  bump(callsTo, pair, 1);
   pending.set(ticket, s);
   return s;
 }
@@ -330,7 +346,8 @@ function pendingSplice(ticket, caller) {
 function settleSplice(s) {
   pending.delete(s.ticket);
   clearTimeout(s.timer);
-  s.caller._relayCalls--;
+  bump(callsFrom, s.from, -1);
+  bump(callsTo, s.pair, -1);
 }
 
 function expireSplice(s) {
@@ -350,17 +367,54 @@ function endSoon(sock) {
 function tryJoin(s) {
   if (s.socks.length !== 2) return;
   settleSplice(s);
-  joinedSplices++;
   const [a, b] = s.socks;
   a._relayPeer = b;
   b._relayPeer = a;
   for (const [src, dst] of [[a, b], [b, a]]) {
     const forward = spliceForwarder(src, dst);
-    src.on("data", (chunk) => { src._relayAlive = true; forward(chunk); });
-    if (src._relayHead?.length) forward(src._relayHead);
+    const take = (chunk) => { src._relayAlive = true; forward(chunk); meter(src, chunk.length); };
+    src._relayHolds = 1;         // paused since its upgrade
+    src.on("data", take);
+    if (src._relayHead?.length) take(src._relayHead);
     src._relayHead = null;
-    src.resume();
+    release(src);
   }
+}
+
+/** A splice socket is read only while nothing holds it: a far end that is full,
+ *  or its address past its traffic budget. */
+function hold(sock) { if (sock._relayHolds++ === 0) sock.pause(); }
+function release(sock) { if (--sock._relayHolds === 0) sock.resume(); }
+
+// What an address sends through its splices is metered, SPLICE_RATE KiB/s with
+// two seconds of burst. Past it, the address's splice sockets are not read until
+// the debt is paid back, so a sender is slowed, not cut off.
+const spliceBudgets = new Map(); // client address to its bucket
+
+function meter(sock, n) {
+  if (SPLICE_RATE === 0) return;
+  let b = spliceBudgets.get(sock._relayIp);
+  if (!b) spliceBudgets.set(sock._relayIp, b = bucket(SPLICE_RATE * 1024));
+  spend(b, 0);
+  b.tokens -= n;
+  if (b.tokens >= 0 || sock._relayMetered) return;
+  sock._relayMetered = true;
+  hold(sock);
+  const t = setTimeout(() => { sock._relayMetered = false; release(sock); }, -b.tokens * 1000 / b.rate);
+  t.unref?.();
+}
+
+/** An address with no sockets left keeps its budget until it has refilled, so
+ *  reconnecting buys no fresh burst. */
+function retireBudget(ip) {
+  const b = spliceBudgets.get(ip);
+  if (!b) return;
+  spend(b, 0);
+  const t = setTimeout(() => {
+    spend(b, 0);
+    if (!ipCounts.has(ip) && b.tokens >= b.burst) spliceBudgets.delete(ip);
+  }, (b.burst - b.tokens) * 1000 / b.rate);
+  t.unref?.();
 }
 
 /** Copies one splice socket's masked client frames to the other end as server
@@ -378,8 +432,8 @@ function spliceForwarder(src, dst) {
     if (dst.destroyed || !dst.writable) return;
     if (!dst.write(bytes) && !src._relayWaiting) {
       src._relayWaiting = true;
-      src.pause();
-      dst.once("drain", () => { src._relayWaiting = false; src.resume(); });
+      hold(src);
+      dst.once("drain", () => { src._relayWaiting = false; release(src); });
     }
   };
   const fail = () => { src.destroy(); dst.destroy(); };
@@ -591,6 +645,11 @@ server.on("upgrade", (req, sock, head) => {
     refuse(sock, 429, "Too Many Requests", "room full");
     return;
   }
+  // One address takes a few seats, not the room.
+  if (existingRoom && [...existingRoom].filter((s) => s._relayIp === ip).length >= MAX_PER_ROOM_IP) {
+    refuse(sock, 429, "Too Many Requests", "per-ip room cap");
+    return;
+  }
   // A splice socket needs a ticket its caller has already called.
   const waiting = splice === null ? null : pending.get(splice);
   if (splice !== null && !waiting) { refuse(sock, 404, "Not Found", "no such splice"); return; }
@@ -617,11 +676,11 @@ server.on("upgrade", (req, sock, head) => {
     sockets.delete(sock);
     const ipKey = sock._relayIp;
     const n = (ipCounts.get(ipKey) ?? 0) - 1;
-    if (n > 0) ipCounts.set(ipKey, n); else ipCounts.delete(ipKey);
+    if (n > 0) ipCounts.set(ipKey, n); else { ipCounts.delete(ipKey); retireBudget(ipKey); }
     if (waiting) {
       const peer = sock._relayPeer;
       if (peer) {
-        if (peer._relayPeer === sock) { peer._relayPeer = null; joinedSplices--; endSoon(peer); }
+        if (peer._relayPeer === sock) { peer._relayPeer = null; endSoon(peer); }
       } else {
         const i = waiting.socks.indexOf(sock);
         if (i >= 0) waiting.socks.splice(i, 1);
@@ -816,9 +875,10 @@ server.on("upgrade", (req, sock, head) => {
       const ticket = payload.subarray(1 + PK_LEN);
       const callee = registered.get(to.toString("hex"));
       const s = callee && callee._relayKey !== sock._relayKey
-        ? pendingSplice(ticket.toString("hex"), sock) : null;
-      // No such key here, a full table, or a ticket already in use: the caller
-      // learns now instead of waiting its splice socket out.
+        ? pendingSplice(ticket.toString("hex"), sock, callee._relayKey) : null;
+      // No such key here, too many calls waiting from this address, or a ticket
+      // already in use: the caller learns now instead of waiting its splice
+      // socket out.
       if (!s) return writeFrame(sock, typed(T_UNREACHABLE, to, ticket));
       writeFrame(callee, typed(T_CALL, Buffer.from(sock._relayKey, "hex"), ticket));
       return true;
@@ -885,7 +945,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  origin allowlist: ${[...ALLOWED_ORIGINS].slice(0, 4).join(", ")}…`);
   console.log(`  control frame cap: ${MAX_FRAME_PAYLOAD} B  socket backlog cap: ${MAX_SOCKET_BACKLOG} B`);
   console.log(`  rooms: any path component (chars [A-Za-z0-9._-], up to ${MAX_ROOM_NAME}); bare "/" = no room`);
-  console.log(`  limits: ${MAX_CONNECTIONS} conns, ${MAX_ROOMS} rooms, ${MAX_CONNS_PER_ROOM}/room, ${MAX_CONNS_PER_IP}/ip, ${MAX_SPLICES} splices${TRUST_PROXY ? " (X-Forwarded-For trusted)" : ""}`);
+  console.log(`  limits: ${MAX_CONNECTIONS} conns, ${MAX_ROOMS} rooms, ${MAX_CONNS_PER_ROOM}/room, ${MAX_CONNS_PER_IP}/ip, ${MAX_PER_ROOM_IP}/ip in a room, splices ${SPLICE_RATE > 0 ? `${SPLICE_RATE} KiB/s per ip` : "unmetered"}${TRUST_PROXY ? " (X-Forwarded-For trusted)" : ""}`);
   console.log(`  heartbeat: ${HEARTBEAT_MS > 0 ? `${HEARTBEAT_MS / 1000}s ping/reap` : "disabled"}`);
   if (HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
     console.log(`  ⚠  bound to ${HOST} — exposed to the network`);
