@@ -2,8 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { EventEmitter, once } from "node:events";
-import { createHash } from "node:crypto";
-import { isUtf8 } from "node:buffer";
+import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from "node:crypto";
 import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { request } from "node:http";
@@ -18,8 +17,13 @@ class Socket extends EventEmitter {
   writable = true;
   writableLength = 0;
   destroyed = false;
+  ended = false;
+  paused = false;
   writes = [];
   write(bytes) { this.writes.push(Buffer.from(bytes)); return true; }
+  pause() { this.paused = true; }
+  resume() { this.paused = false; }
+  end() { this.ended = true; }
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true; this.writable = false; this.emit("close");
@@ -31,7 +35,7 @@ function fixture(args = []) {
   const logs = [], timers = new Set(), beats = [];
   let now = 0;
   const context = {
-    Buffer, URL, createHash, isUtf8, isIP,
+    Buffer, URL, createHash, createPublicKey, randomBytes, verify, isIP,
     performance: { now: () => now },
     process: { argv: ["node", "server", ...args], env: {} },
     console: { log: (s) => logs.push(s) },
@@ -45,57 +49,235 @@ function fixture(args = []) {
     const s = new Socket(); s.remoteAddress = address;
     server.emit("connection", s); return s;
   }
-  function upgrade(s, { room = "room", headers = {}, head } = {}) {
-    server.emit("upgrade", { method: "GET", url: `/${room}`, headers: {
-      upgrade: "websocket", "sec-websocket-version": "13",
+  function upgrade(s, { room = "room", path = `/${room}`, headers = {}, head } = {}) {
+    server.emit("upgrade", { method: "GET", url: path, headers: {
+      upgrade: "websocket", "sec-websocket-version": "13", host: "relay.test",
       "sec-websocket-key": "AAAAAAAAAAAAAAAAAAAAAA==", ...headers,
     } }, s, head);
     return s;
   }
-  return { tcp, upgrade, logs, beats,
-    join: (options, address) => upgrade(tcp(address), options),
+  const join = (options, address) => upgrade(tcp(address), options);
+  /** A control socket that has registered `id` (a fresh one by default). */
+  function member(options = {}, id = identity()) {
+    const s = join(options);
+    s.emit("data", frame(2, registration(id, "relay.test", challenge(s))));
+    s.id = id;
+    return s;
+  }
+  return { tcp, upgrade, logs, beats, join, member,
     advance(ms) { now += ms; for (const t of timers) if (t.at <= now) { timers.delete(t); t.fn(); } },
   };
 }
-function frame(opcode, payload = Buffer.alloc(0)) {
+/** A client frame: masked, as RFC 6455 requires. */
+function frame(opcode, payload = Buffer.alloc(0), mask = Buffer.from([1, 2, 3, 4])) {
   const h = Buffer.alloc(payload.length < 126 ? 6 : payload.length < 65536 ? 8 : 14);
   h[0] = 0x80 | opcode;
   h[1] = 0x80 | (h.length === 6 ? payload.length : h.length === 8 ? 126 : 127);
   if (h.length === 8) h.writeUInt16BE(payload.length, 2);
   if (h.length === 14) h.writeBigUInt64BE(BigInt(payload.length), 2);
-  return Buffer.concat([h, payload]);
+  mask.copy(h, h.length - 4);
+  const body = Buffer.from(payload);
+  for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
+  return Buffer.concat([h, body]);
 }
-const textFrame = (s) => frame(1, Buffer.from(s));
+/** The server frames written to a fake socket after its 101 response. */
+function serverFrames(sock) {
+  const bytes = Buffer.concat(sock.writes.slice(1));
+  const out = [];
+  for (let off = 0; off + 2 <= bytes.length;) {
+    let len = bytes[off + 1] & 0x7f, h = 2;
+    if (len === 126) { len = bytes.readUInt16BE(off + 2); h = 4; }
+    else if (len === 127) { len = Number(bytes.readBigUInt64BE(off + 2)); h = 10; }
+    if (off + h + len > bytes.length) break;
+    out.push({ b0: bytes[off], opcode: bytes[off] & 0x0f, payload: bytes.subarray(off + h, off + h + len) });
+    off += h + len;
+  }
+  return out;
+}
+const typed = (sock) => serverFrames(sock).filter((f) => f.opcode === 2).map((f) => f.payload);
+const challenge = (sock) => typed(sock)[0].subarray(1);
 
-test("malformed UTF-8 drops the sender without forwarding or disconnecting peers", () => {
-  const f = fixture(), receiver = f.join(), attacker = f.join();
-  attacker.emit("data", frame(1, Buffer.from([0xff])));
-  assert.equal(attacker.destroyed, true);
-  assert.equal(receiver.destroyed, false);
-  assert.equal(receiver.writes.length, 1); // handshake only
-  const sender = f.join(); sender.emit("data", textFrame('{"hello":"世界"}'));
-  assert.equal(receiver.writes.at(-1).subarray(2).toString(), '{"hello":"世界"}');
+function identity() {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  return { pk: publicKey.export({ format: "der", type: "spki" }).subarray(12), key: privateKey };
+}
+const DOMAINS = Buffer.from("seedkernel-link-scope-v1\0seedkernel-relay-register-v1\0");
+function registration(id, authority, nonce) {
+  const sig = sign(null, Buffer.concat([DOMAINS, Buffer.from(authority), nonce]), id.key);
+  return Buffer.concat([Buffer.of(1), id.pk, sig]);
+}
+const call = (to, ticket) => frame(2, Buffer.concat([Buffer.of(5), to, ticket]));
+
+test("a node registers by signing the nonce for this relay's authority", () => {
+  const f = fixture(), id = identity();
+  const good = f.join({ headers: { host: "Relay.Test:443" } });
+  assert.equal(typed(good)[0][0], 0x00);
+  assert.equal(challenge(good).length, 32);
+  good.emit("data", frame(2, registration(id, "relay.test", challenge(good))));
+  assert.equal(good.destroyed, false);
+  assert.deepEqual([...typed(good)[1]], [0x01]);
+
+  const replay = f.join();
+  replay.emit("data", frame(2, registration(id, "relay.test", challenge(good))));
+  assert.equal(replay.destroyed, true, "a signature over another socket's nonce");
+  const elsewhere = f.join();
+  elsewhere.emit("data", frame(2, registration(id, "other.test", challenge(elsewhere))));
+  assert.equal(elsewhere.destroyed, true, "a signature for another relay");
+  const late = f.join();
+  f.advance(10_000);
+  assert.equal(late.destroyed, true, "no registration in time");
+  const early = f.join();
+  early.emit("data", call(id.pk, randomBytes(16)));
+  assert.equal(early.destroyed, true, "a call before registering");
+});
+
+test("text frames, unknown types and a second registration drop the sender", () => {
+  for (const bytes of [frame(1, Buffer.from("hi")), frame(2, Buffer.of(9)), frame(2, Buffer.alloc(0))]) {
+    const f = fixture(), s = f.join();
+    s.emit("data", bytes);
+    assert.equal(s.destroyed, true, bytes.toString("hex"));
+  }
+  const f = fixture(), s = f.member();
+  s.emit("data", frame(2, registration(s.id, "relay.test", challenge(s))));
+  assert.equal(s.destroyed, true);
+});
+
+test("a room's members are its registered keys, announced on join and leave", () => {
+  const f = fixture();
+  const a = f.member(), b = f.member(), outsider = f.member({ room: "other" }), roomless = f.member({ path: "/" });
+  const lastB = typed(b).at(-1);
+  assert.equal(lastB[0], 0x02);
+  assert.deepEqual(lastB.subarray(1), a.id.pk, "the newcomer gets the room");
+  assert.deepEqual(typed(a).at(-1), Buffer.concat([Buffer.of(0x03), b.id.pk]), "the room gets the newcomer");
+  assert.equal(typed(outsider).length, 3, "another room hears nothing");
+  assert.equal(typed(roomless).length, 2, "a socket in no room gets no members");
+  const heard = typed(a).length;
+  const b2 = f.member({}, b.id);
+  assert.equal(typed(a).length, heard, "a second socket for the same key is not a new member");
+  b.destroy();
+  assert.equal(typed(a).length, heard, "the key is still in the room");
+  b2.destroy();
+  assert.deepEqual(typed(a).at(-1), Buffer.concat([Buffer.of(0x04), b.id.pk]));
+});
+
+test("a call rings only the callee, and joins the two sockets that bring its ticket", () => {
+  const f = fixture();
+  const a = f.member(), b = f.member({ path: "/" }), c = f.member();
+  const ticket = randomBytes(16), hex = ticket.toString("hex");
+  a.emit("data", call(b.id.pk, ticket));
+  assert.deepEqual(typed(b).at(-1), Buffer.concat([Buffer.of(0x05), a.id.pk, ticket]));
+  assert.equal(typed(c).filter((p) => p[0] === 0x05).length, 0, "no one else sees the ticket");
+
+  const sa = f.join({ path: `/?splice=${hex}`, head: frame(2, Buffer.from("msg1")) });
+  assert.equal(sa.paused, true, "a lone end waits");
+  const sb = f.join({ path: `/?splice=${hex}` });
+  assert.equal(sa.paused, false);
+  assert.deepEqual(serverFrames(sb).map((x) => x.payload.toString()), ["msg1"], "what came early is forwarded");
+  sb.emit("data", frame(2, Buffer.from("msg2")));
+  assert.deepEqual(serverFrames(sa).at(-1).payload.toString(), "msg2");
+  const third = f.join({ path: `/?splice=${hex}` });
+  assert.equal(third.destroyed, true, "a ticket joins two sockets, no more");
+  assert.equal(f.join({ path: `/?splice=${"00".repeat(16)}` }).destroyed, true, "an uncalled ticket is refused");
+  assert.equal(f.join({ path: "/?splice=zz" }).destroyed, true, "a malformed ticket is refused");
+});
+
+test("an unknown callee or a reused ticket is unreachable at once", () => {
+  const f = fixture();
+  const a = f.member(), b = f.member(), ticket = randomBytes(16);
+  a.emit("data", call(identity().pk, ticket));
+  assert.equal(typed(a).at(-1)[0], 0x06);
+  a.emit("data", call(a.id.pk, ticket));
+  assert.equal(typed(a).at(-1)[0], 0x06, "a node cannot call itself");
+  a.emit("data", call(b.id.pk, ticket));
+  a.emit("data", call(b.id.pk, ticket));
+  assert.deepEqual(typed(a).at(-1), Buffer.concat([Buffer.of(0x06), b.id.pk, ticket]));
+  assert.equal(a.destroyed, false);
+});
+
+test("the latest registration of a key takes its calls, and the one before takes over", () => {
+  const f = fixture(), id = identity(), a = f.member();
+  const old = f.member({ path: "/" }, id), latest = f.member({ path: "/" }, id);
+  a.emit("data", call(id.pk, randomBytes(16)));
+  assert.equal(typed(latest).at(-1)[0], 0x05);
+  latest.destroy();
+  a.emit("data", call(id.pk, randomBytes(16)));
+  assert.equal(typed(old).at(-1)[0], 0x05);
+});
+
+test("splice frames stream through with any size, unmasked, fragments and all", () => {
+  const f = fixture(), a = f.member(), b = f.member(), ticket = randomBytes(16);
+  a.emit("data", call(b.id.pk, ticket));
+  const path = `/?splice=${ticket.toString("hex")}`;
+  const sa = f.join({ path }), sb = f.join({ path });
+  const big = randomBytes(300 * 1024);
+  const bytes = frame(2, big);
+  for (let off = 0; off < bytes.length; off += 7777) sa.emit("data", Buffer.from(bytes.subarray(off, off + 7777)));
+  sa.emit("data", Buffer.concat([frame(0, Buffer.from("ab")).fill(0x02, 0, 1), frame(0, Buffer.from("cd"))]));
+  const got = serverFrames(sb);
+  assert.deepEqual(got[0].payload, big);
+  assert.equal(got[1].b0, 0x02, "a fragment keeps its FIN and opcode");
+  assert.deepEqual(got.slice(1).map((x) => x.payload.toString()), ["ab", "cd"]);
+});
+
+test("splice control frames stay on the hop, and a close ends both ends", () => {
+  const f = fixture(), a = f.member(), b = f.member(), ticket = randomBytes(16);
+  a.emit("data", call(b.id.pk, ticket));
+  const path = `/?splice=${ticket.toString("hex")}`;
+  const sa = f.join({ path }), sb = f.join({ path });
+  sa.emit("data", frame(9, Buffer.from("p")));
+  assert.equal(serverFrames(sa).at(-1).opcode, 0xA, "a ping is answered by the relay");
+  assert.equal(serverFrames(sb).length, 0, "and not forwarded");
+  sa.emit("data", frame(8, Buffer.from([3, 232])));
+  assert.equal(serverFrames(sb).at(-1).opcode, 8);
+  assert.equal(sa.ended && sb.ended, true);
+  sa.emit("data", frame(9, Buffer.alloc(200)));
+  assert.equal(sa.destroyed, true, "an oversize control frame fails the splice");
+});
+
+test("one end closing ends the other, and an unjoined ticket expires", () => {
+  const f = fixture(), a = f.member(), b = f.member();
+  const t1 = randomBytes(16), t2 = randomBytes(16);
+  a.emit("data", call(b.id.pk, t1));
+  a.emit("data", call(b.id.pk, t2));
+  const sa = f.join({ path: `/?splice=${t1.toString("hex")}` }), sb = f.join({ path: `/?splice=${t1.toString("hex")}` });
+  sa.destroy();
+  assert.equal(sb.ended, true);
+  f.advance(10_000);
+  assert.equal(sb.destroyed, true, "a far end that never closes is given up on");
+  const lone = f.join({ path: `/?splice=${t2.toString("hex")}` });
+  assert.equal(lone.destroyed, true, "the ticket expired with the first join's clock");
+});
+
+test("splices are capped per relay and per caller", () => {
+  const f = fixture(["--max-splices", "2"]), a = f.member(), b = f.member();
+  for (let i = 0; i < 3; i++) a.emit("data", call(b.id.pk, randomBytes(16)));
+  assert.equal(typed(b).filter((p) => p[0] === 0x05).length, 2);
+  assert.equal(typed(a).at(-1)[0], 0x06, "the table is full");
+  const g = fixture(["--max-per-room", "2"]), c = g.member(), d = g.member();
+  for (let i = 0; i < 3; i++) c.emit("data", call(d.id.pk, randomBytes(16)));
+  assert.equal(typed(c).at(-1)[0], 0x06, "one caller has too many calls waiting");
 });
 
 test("invalid control sizes, RSV, fragmentation, masking and lengths are rejected", () => {
   const invalid = [frame(9, Buffer.alloc(126)), frame(10, Buffer.alloc(65535)),
     Buffer.from([0xc1, 0x80, 0, 0, 0, 0]), Buffer.from([0x01, 0x80, 0, 0, 0, 0]),
-    Buffer.from([0x81, 0]), Buffer.from([0x81, 0xfe, 0, 1, 0, 0, 0, 0, 65])];
+    Buffer.from([0x82, 0]), Buffer.from([0x82, 0xfe, 0, 1, 0, 0, 0, 0, 65])];
   for (const bytes of invalid) {
     const f = fixture(), s = f.join(); s.emit("data", bytes);
     assert.equal(s.destroyed, true, bytes.toString("hex"));
   }
 });
 
-test("pong, broadcast and heartbeat writes respect the complete backlog cap", () => {
-  for (const kind of ["pong", "broadcast", "heartbeat"]) {
-    const f = fixture(), s = f.join();
+test("pong, announcement and heartbeat writes respect the complete backlog cap", () => {
+  for (const kind of ["pong", "announcement", "heartbeat"]) {
+    const f = fixture(), s = f.member();
+    const before = s.writes.length;
     s.writableLength = 256 * 1024 - 1;
     if (kind === "pong") s.emit("data", frame(9));
     if (kind === "heartbeat") f.beats[0]();
-    if (kind === "broadcast") f.join().emit("data", textFrame("hello"));
+    if (kind === "announcement") f.member();
     assert.equal(s.destroyed, true, kind);
-    assert.equal(s.writes.length, 1, kind);
+    assert.equal(s.writes.length, before, kind);
   }
   const f = fixture(), s = f.join();
   s.emit("data", frame(9, Buffer.from("ping")));
@@ -109,6 +291,11 @@ test("null Origin is rejected by default and requires explicit opt-in", () => {
   assert.equal(f.join({ headers: { origin: "http://localhost:3000" } }).destroyed, false);
   assert.equal(f.join().destroyed, false);
   assert.equal(fixture(["--allow-origin", "null"]).join({ headers: { origin: "null" } }).destroyed, false);
+});
+
+test("a control socket needs a Host to register against", () => {
+  const f = fixture();
+  assert.equal(f.join({ headers: { host: undefined } }).destroyed, true);
 });
 
 test("proxy trust cannot be enabled without specifying proxy addresses", () => {
@@ -151,6 +338,7 @@ test("TCP caps cover incomplete handshakes and release slots on close", () => {
   const third = f.tcp("192.0.2.3");
   assert.equal(third.destroyed, false);
   f.upgrade(third);
+  third.emit("data", frame(2, registration(identity(), "relay.test", challenge(third))));
   f.advance(10_000);
   assert.equal(second.destroyed, true);
   assert.equal(third.destroyed, false);
@@ -161,55 +349,42 @@ test("frame and input byte floods disconnect their sender", () => {
   s.emit("data", Buffer.concat(Array.from({ length: 257 }, () => frame(10))));
   assert.equal(s.destroyed, true);
   const large = f.join();
-  for (let i = 0; i < 9; i++) large.emit("data", frame(2, Buffer.alloc(65536)));
-  assert.equal(large.destroyed, true);
+  large.emit("data", Buffer.alloc(600 * 1024));
+  assert.equal(large.destroyed, true, "bytes are charged before they are parsed");
 });
 
-test("room fan-out budgets aggregate senders and refill over time", () => {
-  const f = fixture(), peers = Array.from({ length: 64 }, () => f.join());
-  const large = frame(2, Buffer.alloc(65536));
-  peers[0].emit("data", large);
-  assert.equal(peers[0].destroyed, false);
-  peers[1].emit("data", large);
-  assert.equal(peers[1].destroyed, true);
+test("join announcements are charged to the room and refill over time", () => {
+  const f = fixture(["--max-per-room", "200", "--max-per-ip", "1000"]);
+  const peers = [];
+  while (peers.length < 200 && !peers.at(-1)?.destroyed) peers.push(f.member());
+  assert.equal(peers.at(-1).destroyed, true, "a room that cannot afford the fan-out refuses the joiner");
+  assert.ok(peers.length > 60, `the budget covers a full default room, got ${peers.length}`);
   f.advance(2000);
-  peers[2].emit("data", large);
-  assert.equal(peers[2].destroyed, false);
+  assert.equal(f.member().destroyed, false);
 });
 
-test("global egress budgets survive room turnover", () => {
-  const f = fixture(["--max-per-ip", "1024"]);
-  let limited = false;
-  for (let i = 0; i < 10; i++) {
-    const peers = Array.from({ length: 64 }, () => f.join({ room: `room${i}` }));
-    peers[0].emit("data", frame(2, Buffer.alloc(65536)));
-    limited ||= peers[0].destroyed;
-    peers.forEach((s) => s.destroy());
-  }
-  assert.equal(limited, true);
-});
-
-test("room names and request headers never appear in event logs", () => {
+test("room names, keys and request headers never appear in event logs", () => {
   const f = fixture(["--max-per-room", "1"]), secret = "secret-capability";
-  const s = f.join({ room: secret });
+  const s = f.member({ room: secret });
   f.join({ room: secret });
   s.destroy();
   f.join({ room: `${secret}/invalid?${secret}` });
   f.join({ headers: { origin: `https://${secret}.test` } });
   assert.ok(f.logs.length > 0);
   assert.equal(f.logs.join("\n").includes(secret), false);
+  assert.equal(f.logs.join("\n").includes(s.id.pk.toString("hex")), false);
 });
 
-test("frames in the upgrade head and split across reads preserve room isolation", () => {
-  const f = fixture(), receiver = f.join(), outsider = f.join({ room: "other" });
-  const packet = textFrame("hello");
-  const sender = f.join({ head: packet.subarray(0, 3) });
-  sender.emit("data", packet.subarray(3));
-  assert.equal(receiver.writes.at(-1).toString("hex"), "810568656c6c6f");
-  assert.equal(outsider.writes.length, 1);
+test("a registration split across the upgrade head and later reads is accepted", () => {
+  const f = fixture(), id = identity();
+  const s = f.join();
+  const packet = frame(2, registration(id, "relay.test", challenge(s)));
+  s.emit("data", packet.subarray(0, 3));
+  s.emit("data", packet.subarray(3));
+  assert.equal(typed(s)[1][0], 0x01);
 });
 
-test("real HTTP upgrade broadcasts valid text and isolates malformed senders", { timeout: 10000 }, async (t) => {
+test("real sockets: register, call and splice through a running relay", { timeout: 10000 }, async (t) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
   const child = spawn(process.execPath, [fileURLToPath(new URL("../server.mjs", import.meta.url)), "0"],
     { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
@@ -224,26 +399,39 @@ test("real HTTP upgrade broadcasts valid text and isolates malformed senders", {
     child.once("error", reject);
     child.once("exit", (code) => reject(new Error(`server exited ${code}`)));
   });
-  const join = () => new Promise((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, path: "/integration", headers: {
+  const open = (path) => new Promise((resolve, reject) => {
+    const req = request({ host: "127.0.0.1", port, path, headers: {
       Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13",
       "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
     } });
     req.once("error", reject);
-    req.once("upgrade", (_res, socket) => { t.after(() => socket.destroy()); resolve(socket); });
+    req.once("upgrade", (_res, socket, head) => {
+      t.after(() => socket.destroy());
+      socket.got = Buffer.from(head);
+      socket.on("data", (d) => { socket.got = Buffer.concat([socket.got, d]); socket.emit("got"); });
+      resolve(socket);
+    });
     req.once("response", (res) => { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); });
     req.end();
   });
-  const receiver = await join(), sender = await join();
-  let received = Buffer.alloc(0);
-  receiver.on("data", (data) => { received = Buffer.concat([received, data]); });
-  const closed = once(sender, "close");
-  sender.write(frame(1, Buffer.from([0xff])));
-  sender.resume();
-  await closed;
-  const healthy = await join();
-  const data = once(receiver, "data");
-  healthy.write(textFrame("ok"));
-  await data;
-  assert.equal(received.toString("hex"), "81026f6b");
+  const frames = (s) => serverFrames({ writes: [Buffer.alloc(0), s.got] });
+  const until = async (s, pred) => { while (!pred(frames(s))) await once(s, "got"); return frames(s); };
+  const register = async (s, id) => {
+    const [c] = await until(s, (fs) => fs.length >= 1);
+    s.write(frame(2, registration(id, `127.0.0.1:${port}`, c.payload.subarray(1))));
+    await until(s, (fs) => fs.some((x) => x.payload[0] === 0x01));
+  };
+  const ida = identity(), idb = identity();
+  const a = await open("/room"), b = await open("/room");
+  await register(a, ida);
+  await register(b, idb);
+  const ticket = randomBytes(16);
+  a.write(call(idb.pk, ticket));
+  await until(b, (fs) => fs.some((x) => x.payload[0] === 0x05));
+  const sa = await open(`/?splice=${ticket.toString("hex")}`);
+  const sb = await open(`/?splice=${ticket.toString("hex")}`);
+  const payload = randomBytes(100_000);
+  sa.write(frame(2, payload));
+  const [got] = await until(sb, (fs) => fs.length >= 1);
+  assert.deepEqual(got.payload, payload);
 });

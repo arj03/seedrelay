@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "App-neutral WebSocket rendezvous for seedkernel WebRTC meshes.",
+  "description": "App-neutral relay for seedkernel nodes: signed registration, rooms and splices.",
   "bin": {
     "seedrelay": "./server.mjs"
   },

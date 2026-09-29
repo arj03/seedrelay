@@ -1,26 +1,26 @@
-# seedrelay: a signaling relay for [seedkernel](https://github.com/arj03/seedkernel)
+# seedrelay: a relay for [seedkernel](https://github.com/arj03/seedkernel)
 
-The app-neutral rendezvous for seedkernel WebRTC meshes. Peers meet in a **room** on
-the relay, exchange SDP offers/answers and ICE candidates, then open peer-to-peer
-data channels and stop needing the relay. Once every pair of active
-peers is linked, the relay can be killed without disrupting traffic; it only matters
-for adding new peers.
+The app-neutral relay for seedkernel nodes. A node **registers** its key here by signing
+a challenge, meets the other members of a **room**, and reaches any registered key
+through a **splice**: two sockets the relay joins, forwarding what one sends to the
+other. That is how a node nobody can dial (a browser, or anything behind NAT) is
+reached. Once linked, the nodes move to a direct link where they can (WebRTC, or an
+address the node advertises), and the relay closes the splice.
 
-The package is one piece: **`server.mjs`**, a bounded WebSocket broadcast server
-partitioned by room, with no third-party dependencies. The other end is the seedkernel
-transport bundle, which joins a room and speaks its own signaling frames through it
-(seedkernel §12.7), so there is no client library to install.
+The package is one piece: **`server.mjs`**, a bounded WebSocket server, with no
+third-party dependencies. The other end is the seedkernel transport bundle, which
+speaks the relay's wire itself (seedkernel §12.7), so there is no client library to
+install.
 
-The relay is deliberately dumb: every frame from one client is forwarded verbatim to
-every other client in the same room. It carries only peer discovery, SDP and ICE, and
-it is not trusted with anything else. Application data travels over the data
-channels, and peer identity is authenticated inside those channels by the seedkernel
-transport, so a relay can observe signaling metadata and refuse to forward, but can
-never impersonate a peer.
+The relay is not trusted with traffic. The seedkernel channel handshake runs end to
+end through a splice, so the relay forwards ciphertext it cannot read and cannot pose
+as either end, and the callee's contact secret gates a call as it gates any dial. What
+a relay does see: which keys are registered and in which room, who calls whom, and when
+and how much they send until they move to a direct link.
 
 This lives outside the seedkernel repo because a relay is a deployment concern, not
-trusted runtime surface: the kernel ships no server, and its own tests signal
-in-process. [seedchat](https://github.com/arj03/seedchat) and
+trusted runtime surface: the kernel ships no server, and its own tests use an
+in-process relay. [seedchat](https://github.com/arj03/seedchat) and
 [seedstore](https://github.com/arj03/seedstore) both use it.
 
 **Contents:** [Quick start](#quick-start) · [Running the server](#running-the-server) ·
@@ -86,25 +86,64 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--max-conns N` | `RELAY_MAX_CONNS` | `1024` | Concurrent sockets across the relay, including those still awaiting upgrade. |
 | `--max-rooms N` | `RELAY_MAX_ROOMS` | `512` | Concurrent rooms. |
 | `--max-per-room N` | `RELAY_MAX_PER_ROOM` | `64` | Sockets per room. |
-| `--max-per-ip N` | `RELAY_MAX_PER_IP` | `64` | Sockets per client address. |
+| `--max-per-ip N` | `RELAY_MAX_PER_IP` | `64` | Sockets per client address, splice sockets included. |
+| `--max-splices N` | `RELAY_MAX_SPLICES` | `1024` | Splices joined or waiting for their sockets. |
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
 | `--trust-proxy` | `RELAY_TRUST_PROXY=1` | | Legacy. Now fails at startup unless trusted proxy addresses are also given. |
 
 Malformed numeric values fall back to the default.
 
-### Rooms
+### Sockets
 
-Clients join `ws://host:port/<room>`. A bare `ws://host:port/` joins the default room
-`global`, and any query string is ignored. Room names are made of `[A-Za-z0-9._-]` and
-are at most 128 characters; anything else is refused with `400 Bad Request`. A room
-exists for as long as anyone is in it.
+| Path | Socket |
+| --- | --- |
+| `/<room>` | A control socket that joins `<room>` once registered |
+| `/` | A control socket in no room: its key can be called, but it meets nobody |
+| `/?splice=<32 hex>` | One end of a splice, named by a ticket its caller has called |
 
-Rooms are not authenticated: **a room name is a bearer credential.** For a private
-room, use at least 16 random bytes encoded as hex. The relay never logs room names or
-request paths; configure reverse-proxy access logs and monitoring to omit or redact
-them too. Apps that need more than an unguessable name gate peers inside the
-seedkernel transport, as seedchat's invite links do.
+Room names are made of `[A-Za-z0-9._-]` and are at most 128 characters; anything else
+is refused with `400 Bad Request`. A room exists for as long as anyone is in it. A
+splice socket with a ticket nobody called is refused with `404`, and a third socket for
+one ticket with `409`.
+
+### The wire
+
+A control socket carries binary frames whose first byte is the type. Keys are 32-byte
+seedkernel identities, tickets 16 random bytes chosen by the caller.
+
+| Relay → node | | Node → relay | |
+| --- | --- | --- | --- |
+| `0x00` challenge | `[nonce 32]` | `0x01` register | `[pk 32][sig 64]` |
+| `0x01` registered | | `0x05` call | `[to 32][ticket 16]` |
+| `0x02` members | `[pk 32]*`, the room, once | | |
+| `0x03` joined | `[pk 32]` | | |
+| `0x04` left | `[pk 32]` | | |
+| `0x05` incoming | `[from 32][ticket 16]` | | |
+| `0x06` unreachable | `[to 32][ticket 16]` | | |
+
+- **Registration.** The relay sends a nonce on upgrade, and the node must answer within
+  10 seconds with its key and an Ed25519 signature over
+  `"seedkernel-link-scope-v1\0" ‖ "seedkernel-relay-register-v1\0" ‖ authority ‖ nonce`,
+  where `authority` is the relay's `Host`, lowercased and without a `:80` or `:443`
+  port. The first prefix is the one seedkernel's host puts in front of everything its
+  transport signs. Anything else before registering, or a bad signature, drops the
+  socket. Calls for a key go to the socket that registered it most recently.
+- **Rooms.** A registered socket in a room gets the room's other keys once, then
+  `joined` and `left` as keys come and go. Two sockets with one key are one member.
+- **Calls.** `call` sends `incoming` to the callee's socket only, or answers
+  `unreachable` when the key is not registered here, is the caller's own, or the ticket
+  is in use. Both ends then open `/?splice=<ticket>`, and the relay joins them once
+  both are there, or drops them after 10 seconds.
+- **Splices.** Data frames are streamed through unmasked, whatever their size or
+  fragmentation, so the relay holds a chunk, never a whole message. Ping and pong stay on
+  each hop, and a close ends both ends. A full receiver pauses the sender.
+
+Rooms are not authenticated: **a room name is a bearer credential** for learning which
+keys are in it. For a private room, use at least 16 random bytes encoded as hex. The
+relay never logs room names, keys or request paths; configure reverse-proxy access logs
+and monitoring to omit or redact them too. Reaching a key needs no room at all, and the
+callee's contact secret is what gates it.
 
 ### Origins
 
@@ -127,23 +166,26 @@ when that access is intended. Native clients that send no `Origin` header, such 
 
 ### Limits
 
-The relay is sized for signaling: SDPs are a few KB and ICE candidates a few hundred
-bytes.
+Control sockets carry a few small frames each; splices carry the traffic.
 
-- **Frames** are capped at 64 KiB, and text frames must be valid UTF-8. Fragmented
-  frames and WebSocket extensions are unsupported.
-- **Backlog.** Every frame write, including ping/pong, respects a 256 KiB per-socket
-  backlog cap; slow readers are disconnected.
+- **Control frames** are binary and capped at 64 KiB. Text, fragmented frames and
+  WebSocket extensions are unsupported.
+- **Backlog.** Every write to a control socket, including ping/pong, respects a 256 KiB
+  per-socket backlog cap; slow readers are disconnected. Splices use backpressure
+  instead.
 - **Handshakes** must complete within 10 seconds of the TCP connection, however
-  slowly the input trickles in.
-- **Traffic** is metered by token buckets with two seconds of burst allowance.
-  Broadcast cost counts every recipient.
+  slowly the input trickles in, and registration within 10 seconds of the upgrade.
+- **Splices.** `--max-splices` (`RELAY_MAX_SPLICES`, default 1024) caps splices joined
+  or waiting, and one control socket may have as many calls waiting as a room has
+  members. A splice's bandwidth is not metered; cap it at a proxy if it has to be.
+- **Traffic** on control sockets is metered by token buckets with two seconds of burst
+  allowance. Announcing a room member counts every recipient.
 
 | Scope | Sustained limit |
 | --- | --- |
 | Incoming per connection | 128 frames/s and 256 KiB/s |
 | Incoming across the relay | 8,192 frames/s and 4 MiB/s |
-| Outgoing per room | 2,048 recipient frames/s and 2 MiB/s |
+| Outgoing announcements per room | 2,048 recipient frames/s and 2 MiB/s |
 | Outgoing across the relay | 16,384 recipient frames/s and 16 MiB/s |
 
 Exceeding a traffic budget disconnects the sender; clients should reconnect with
@@ -178,10 +220,11 @@ once its headers arrive. Apply connection and request limits at the proxy as wel
 ## Joining a room
 
 A seedkernel node joins through its transport bundle's host-only `relay` operation,
-naming the room URL; the transport opens the WebSocket itself, says hello, and
-connects the peers it meets there (seedkernel §12.6, §12.7). An embedder supplies only
-the sockets: a factory that can reach the relay and seedkernel's `RtcNetwork` for the
-peer connections.
+naming the room URL; the transport opens the WebSocket itself, registers, and calls the
+members it meets there (seedkernel §12.6, §12.7). A peer outside any room is reached by
+an address naming its relay, `<pk>@relay+wss://relay.example:443`. An embedder supplies
+only the sockets: a factory that can reach the relay and, for the move to WebRTC,
+seedkernel's `RtcNetwork` for the peer connections.
 
 ```js
 import { WsNetwork } from "seedkernel-wasm/net-ws";
@@ -194,15 +237,14 @@ await shell.call("_net", new OpArgs("relay").text("wss://relay.example/my-room")
 ```
 
 The transport redials a relay that drops, and its `relayState` operation reports
-whether the link is up. Frames are binary, UTF-8 inside, and at most 64 KiB, well within
-the relay's frame cap.
+whether it is registered.
 
 ## What's here
 
 | Path | What it is |
 | --- | --- |
 | `server.mjs` | The relay server and the `seedrelay` bin. The option list is also in its header comment. |
-| `test/server.test.mjs` | Drives the server with fake sockets: frame validation, backlog caps, origins, proxy trust, connection caps, traffic budgets and log redaction. |
+| `test/server.test.mjs` | Drives the server with fake sockets: registration, rooms, calls and splices, frame validation, backlog caps, origins, proxy trust, connection caps, traffic budgets and log redaction; and one run over real sockets. |
 
 ## Troubleshooting
 
@@ -225,3 +267,8 @@ the relay's frame cap.
   `--trusted-proxy`.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,
   exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff.
+- **A node never registers.** The relay logs `! dropped: bad registration`: the node
+  signed for another authority than the `Host` the relay saw, which happens when a
+  proxy rewrites `Host`. Forward the original `Host`.
+- **A call comes back unreachable.** The callee is not registered on this relay, or
+  the splice table (`--max-splices`) is full.
