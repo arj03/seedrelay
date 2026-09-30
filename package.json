@@ -4,10 +4,16 @@
   "private": true,
   "type": "module",
   "description": "App-neutral relay for seedkernel nodes: signed registration, rooms and splices.",
+  "exports": {
+    ".": "./relay.mjs",
+    "./rooms": "./rooms.mjs"
+  },
   "bin": {
     "seedrelay": "./server.mjs"
   },
   "files": [
+    "relay.mjs",
+    "rooms.mjs",
     "server.mjs"
   ],
   "scripts": {
