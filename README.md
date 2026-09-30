@@ -2,10 +2,10 @@
 
 The app-neutral relay for seedkernel nodes. A node **registers** its key here by signing
 a challenge, and reaches any registered key through a **splice**: two sockets the relay
-joins, forwarding what one sends to the other. Apps meet each other's keys in **rooms**,
-IRC-style, with the small client in `rooms.mjs`. That is how a node nobody can dial (a browser, or anything behind NAT) is
-reached. Once linked, the nodes move to a direct link where they can (WebRTC, or an
-address the node advertises), and close the splice behind them.
+joins, forwarding what one sends to the other. That is how a node nobody can dial (a
+browser, or anything behind NAT) is reached. Once linked, the nodes move to WebRTC where
+they can, and close the splice behind them. Apps meet each other's keys in **rooms**,
+IRC-style, with the small client in `rooms.mjs`.
 
 The package is **`relay.mjs`**, a bounded WebSocket server (`createRelay`),
 **`server.mjs`**, the bin that runs it, and **`rooms.mjs`**, the room client apps use,
@@ -248,7 +248,7 @@ stays on a splice of two sockets. A room of N members that all stay relayed cost
 N(N−1) splice sockets plus N control sockets, and its smallest key, which calls the
 rest, is charged 2(N−1) + 1 of them against its address. The defaults fit one such room
 at `--max-per-room` (32 members: 992 splice sockets of the 1,792 splices may hold, and
-63 of an address's 64). Pairs that move to WebRTC or an advertised address cost the relay
+63 of an address's 64). Pairs that move to WebRTC cost the relay
 nothing, so most rooms need far less; a relay that hosts several large rooms of native
 nodes behind NAT should raise `--max-conns` with the process's file limit.
 
