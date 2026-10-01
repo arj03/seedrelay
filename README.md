@@ -88,15 +88,15 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--allow-origin ORIGIN` | | localhost pages | Allowed browser `Origin`. Repeatable; see [Origins](#origins). |
 | `--max-conns N` | `RELAY_MAX_CONNS` | `2048` | Concurrent sockets across the relay, including those still awaiting upgrade. Splice sockets may take 7/8 of them. |
 | `--max-rooms N` | `RELAY_MAX_ROOMS` | `512` | Concurrent rooms. |
-| `--max-per-room N` | `RELAY_MAX_PER_ROOM` | `32` | Registered sockets per room. |
-| `--max-per-ip N` | `RELAY_MAX_PER_IP` | `64` | Sockets charged to one client address: its own, and both ends of every splice it called. |
+| `--max-per-room N` | `RELAY_MAX_PER_ROOM` | `32` | Registered sockets per room, at most 1024: filling a room costs announcements by the square of its size. |
+| `--max-per-ip N` | `RELAY_MAX_PER_IP` | `72` | Sockets charged to one client address: its own, and both ends of every splice it called. |
 | `--max-per-room-ip N` | `RELAY_MAX_PER_ROOM_IP` | `16` | Registered sockets one client address may hold in one room. |
 | `--ipv6-prefix N` | `RELAY_IPV6_PREFIX` | `64` | How many leading bits of an IPv6 address name one client, for every per-address limit. |
-| `--register-rate N` | `RELAY_REGISTER_RATE` | `4` | Control sockets one client address may open per second, with two seconds of burst; `0` leaves them unmetered. |
+| `--register-rate N` | `RELAY_REGISTER_RATE` | `4` | Control and room sockets one client address may open per second, with two seconds of burst, and rooms it may join per second, with 32 at once; `0` leaves both unmetered. |
 | `--splice-rate N` | `RELAY_SPLICE_RATE` | `1024` | KiB/s one client address may send through its splices; `0` leaves them unmetered. |
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
-| `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
+| `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters, with no commas or whitespace at either end. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
 | `--stun [HOST:]PORT` | `RELAY_STUN` | off | Answer STUN Binding requests on this UDP port, on `--host` unless a host is named. Nodes ask a relay's port `3478`; see [STUN](#stun). |
 
 A malformed value or an unknown option stops the relay at startup, rather than leaving it
@@ -161,9 +161,8 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`,
   any other socket or with any other key. A relay without secrets ignores the MAC.
 - **Rooms.** A registered room socket joins rooms by id, up to 16 at once, and leaves
   them, as IRC's `/join` and `/part` do. `rooms.mjs` makes a room's id by hashing its
-  name, SHA-256 of `"seedrelay-room-v1\0" ‖ name`, so the relay never learns names. A join gets the room's other keys,
-  over as many `members` frames as they need, then `joined` and `left` as keys come
-  and go. Two sockets with one key are one member. A join the room has no seat for (see
+  name, SHA-256 of `"seedrelay-room-v1\0" ‖ name`, so the relay never learns names. A join gets the room's other keys
+  in one `members` frame, then `joined` and `left` as keys come and go. Two sockets with one key are one member. A join the room has no seat for (see
   [Limits](#limits)) is answered `refused`, and the socket stays registered. A room
   exists for as long as anyone is in it.
 - **Calls.** `call` sends `incoming` to the callee's socket only, with a ticket of the
@@ -208,13 +207,13 @@ when that access is intended. Native clients that send no `Origin` header, such 
 
 ### Limits
 
-Control sockets carry a few small frames each; splices carry the traffic.
+Control and room sockets carry a few small frames each; splices carry the traffic.
 
-- **Control frames** from a node are binary and capped at 256 bytes; the largest, a
+- **Control frames** on control and room sockets are binary and capped at 256 bytes; the largest, a
   registration, is 97, or 161 with a secret's MAC. Text, fragmented frames and WebSocket extensions are
   unsupported. Both kinds of socket read frames with one parser and the same rules,
   lengths in their shortest encoding included.
-- **Backlog.** Every write to a control socket, including ping/pong, respects a 256 KiB
+- **Backlog.** Every write to a control or room socket, including ping/pong, respects a 256 KiB
   per-socket backlog cap; slow readers are disconnected. Splices use backpressure
   instead.
 - **Handshakes** must complete within 10 seconds of the TCP connection, however
@@ -234,10 +233,11 @@ Control sockets carry a few small frames each; splices carry the traffic.
   no seat.
 - **Addresses.** An IPv6 client is accounted by its `/64` (`--ipv6-prefix`), since one
   host is routinely handed a whole `/64`. One address opens at most `--register-rate`
-  control sockets a second (default 4, with two seconds of burst).
+  control and room sockets a second (default 4, with two seconds of burst), and joins
+  rooms at the same rate, with 32 at once, so an app redialing joins all its rooms again.
 - **Traffic** on control sockets is metered by token buckets with two seconds of burst
-  allowance. What a room announces is bounded by the registration rate: a joiner is never
-  turned away for what announcing it costs.
+  allowance. What a room announces is bounded by the join rate, however a socket leaves
+  and joins again: a joiner is never turned away for what announcing it costs.
 
 | Scope | Sustained limit |
 | --- | --- |
@@ -255,10 +255,11 @@ availability against a distributed denial of service.
 
 Every room member links to every other, and a pair that cannot move to a direct link
 stays on a splice of two sockets. A room of N members that all stay relayed costs
-N(N−1) splice sockets plus N control sockets, and its smallest key, which calls the
-rest, is charged 2(N−1) + 1 of them against its address. The defaults fit one such room
-at `--max-per-room` (32 members: 992 splice sockets of the 1,792 splices may hold, and
-63 of an address's 64). Pairs that move to WebRTC cost the relay
+N(N−1) splice sockets plus N control and N room sockets, and its smallest key, which
+calls the rest, is charged 2(N−1) + 2 of them against its address, its app's room
+socket included. The defaults fit one such room at `--max-per-room` (32 members: 992
+splice sockets of the 1,792 splices may hold, and 64 of an address's 72, leaving room
+to redial). Pairs that move to WebRTC cost the relay
 nothing, so most rooms need far less; a relay that hosts several large rooms of native
 nodes behind NAT should raise `--max-conns` with the process's file limit.
 
@@ -268,7 +269,8 @@ WebRTC connects two nodes behind NAT only once each knows the address the intern
 it at, which it learns from a STUN server. The seedkernel transport asks the relay a
 peer is linked through, at `stun:<relay host>:3478`: the relay already sees that
 address, so no third party learns who is online. `--stun` answers those requests on UDP
-(RFC 8489 Binding only, at most 20 a second to one address). Without it, pairs on
+(RFC 8489 Binding only, at most 20 a second to one address, and at most 256 new
+addresses a second, since UDP sources can be forged). Without it, pairs on
 different networks mostly stay relayed.
 
 ## Deploying publicly
@@ -399,7 +401,7 @@ with `--relay-secret`.
 - **Upgrade refused with `403`.** The page's origin is not on the allowlist. Common
   causes are a dev server on a port outside the default list, a `file://` page
   (`Origin: null`), or an `--allow-origin` flag that replaced the localhost defaults.
-  The relay logs `! rejected upgrade: origin not allowed`.
+  The relay logs `! refused upgrade: origin not allowed`.
 - **Upgrade refused with `421`.** The `Host` the node dialed is not one of the relay's
   names. Add it with `--authority`; behind a proxy, forward the original `Host`.
 - **Upgrade refused with `404`.** The path is not under `/v1/`, so the client speaks
@@ -407,7 +409,7 @@ with `--relay-secret`.
 - **Upgrade refused with `400`.** Behind a trusted proxy, the `X-Forwarded-For` chain
   is missing or malformed.
 - **Upgrade refused with `429`, or a join `refused`.** A connection or room cap, or the
-  registration rate, was hit; the relay logs which one. Raise it with the matching
+  registration or join rate, was hit; the relay logs which one. Raise it with the matching
   option.
 - **Other devices can't connect.** The relay binds `127.0.0.1` by default. Bind a
   reachable interface with `--host`, or better, put it behind a TLS proxy (see

@@ -1,5 +1,5 @@
 // The rendezvous and forwarder for seedkernel nodes (§12.7). A node registers its key
-// here over a control socket, learns the other members of a room, and reaches any
+// here over a control socket, its app meets other keys in rooms, and the node reaches any
 // registered key through a splice: two fresh sockets the relay joins, copying bytes
 // between them. The seedkernel channel handshake runs end to end through a splice, so
 // the relay forwards ciphertext it cannot read, and cannot pose as either end. It lives
@@ -26,10 +26,9 @@
 // since the node's own contact secret gates its handshake end to end.
 //
 // A relay started with a secret (`--secret`) serves only those who know it: both kinds
-// of registration must carry a MAC of the signature under the secret, so the secret
-// itself never crosses the wire, and a MAC a listener sees is good for that socket only.
-// Splice sockets need no proof of their own, since only registered sockets place and
-// take the calls that hand out tickets.
+// of registration must carry a MAC under it (`secretProof`). Splice sockets need no proof
+// of their own, since only registered sockets place and take the calls that hand out
+// tickets.
 //
 // A splice is set up by a call: the caller names the callee's key and a fresh ticket on
 // its control socket, the relay passes the callee a ticket of its own on the callee's
@@ -49,28 +48,33 @@ import { isIP } from "node:net";
 //
 // Independent caps that bound the relay's footprint against both accidental fan-out and
 // deliberate exhaustion. A room whose N members all stay relayed costs N(N-1) splice
-// sockets and N control sockets, and its smallest key, which calls the rest, is charged
-// 2(N-1) + 1 of them. The defaults fit one full room so relayed on its share of the
-// relay (992 of 1792 splice sockets) and within its caller's share of an address (63 of
-// 64); rooms whose pairs move to direct links cost far less.
-const DEFAULT_LIMITS =Object.freeze({
+// sockets, N control sockets and N room sockets, and its smallest key, which calls the
+// rest, is charged 2(N-1) + 2 of them, its app's room socket included. The defaults fit
+// one full room so relayed on its share of the relay (992 of 1792 splice sockets) and
+// within its caller's share of an address (64 of 72, with room to redial); rooms whose
+// pairs move to direct links cost far less.
+const DEFAULT_LIMITS = Object.freeze({
   maxConns: 2048,      // sockets across the relay, including those still awaiting upgrade
   maxRooms: 512,       // rooms
   maxPerRoom: 32,      // registered sockets in one room
-  maxPerIp: 64,        // sockets charged to one client address
+  maxPerIp: 72,        // sockets charged to one client address
   maxPerRoomIp: 16,    // registered sockets one address holds in one room
   ipv6Prefix: 64,      // the bits of an IPv6 address that name one client
-  registerRate: 4,     // control sockets an address opens per second, 0 = unmetered
+  registerRate: 4,     // sockets an address registers, and rooms it joins, per second; 0 = unmetered
   spliceRate: 1024,    // KiB/s an address sends through splices, 0 = unmetered
   heartbeatSecs: 30,   // ping/reap interval, 0 = off
 });
+
+// Filling a room of N costs N(N-1) announcements, and each joiner gets all N keys in one
+// members frame, so no room takes more seats than this: a members frame of 32 KiB.
+const MAX_PER_ROOM = 1024;
 
 // The command line, flag by flag: its `createRelay` option, environment variable, and the
 // largest integer it takes (Infinity for any number).
 const LIMIT_FLAGS = {
   "--max-conns":       ["maxConns",      "RELAY_MAX_CONNS",       Number.MAX_SAFE_INTEGER],
   "--max-rooms":       ["maxRooms",      "RELAY_MAX_ROOMS",       Number.MAX_SAFE_INTEGER],
-  "--max-per-room":    ["maxPerRoom",    "RELAY_MAX_PER_ROOM",    Number.MAX_SAFE_INTEGER],
+  "--max-per-room":    ["maxPerRoom",    "RELAY_MAX_PER_ROOM",    MAX_PER_ROOM],
   "--max-per-ip":      ["maxPerIp",      "RELAY_MAX_PER_IP",      Number.MAX_SAFE_INTEGER],
   "--max-per-room-ip": ["maxPerRoomIp",  "RELAY_MAX_PER_ROOM_IP", Number.MAX_SAFE_INTEGER],
   "--ipv6-prefix":     ["ipv6Prefix",    "RELAY_IPV6_PREFIX",     128],
@@ -140,8 +144,14 @@ function authorityOption(value) {
 // offline, so a secret must be too long to guess.
 const MIN_SECRET_LEN = 16;
 
+/** A secret as it reads from --secret, RELAY_SECRETS and a client's file alike: the
+ *  variable splits on commas and trims, as seedkernel trims its file, so neither may be
+ *  in one. */
 function secretOption(value) {
   if (value.length < MIN_SECRET_LEN) throw new Error(`a secret takes at least ${MIN_SECRET_LEN} characters`);
+  if (value.includes(",") || value !== value.trim()) {
+    throw new Error("a secret takes no commas, and no whitespace at either end");
+  }
   return value;
 }
 
@@ -174,20 +184,18 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // ─── safety limits ───────────────────────────────────────────────────────
 //
-// A node sends a registration (97 bytes, 161 with a secret's MAC) or a call (49): a frame
-// past this is not the wire. Splice frames are not measured, since the relay streams them
-// through without holding one whole.
+// A client sends a registration (97 bytes, 161 with a secret's MAC), a call (49) or a join
+// or leave (33): a frame past this is not the wire. Splice frames are not measured, since
+// the relay streams them through without holding one whole.
 const MAX_CONTROL_PAYLOAD = 256;
-// Every write to a control socket, including control frames, shares the same hard
-// backlog cap.
+// Every write to a control or room socket, including control frames, shares the same
+// hard backlog cap.
 const MAX_SOCKET_BACKLOG = 256 * 1024;
 // From the TCP connection to the upgrade, and from the upgrade to registration.
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 // How long a call waits for both of its splice sockets, and how long a socket the relay
 // ended is given to close before it is destroyed.
 const SPLICE_WAIT_MS = 10_000;
-// Keys in one members frame, well inside a node's 64 KiB frame cap.
-const MAX_KEYS_PER_FRAME = 1024;
 // Splice sockets may take this share of --max-conns and no more, so a relay busy with
 // splices still has room for nodes to register.
 const SPLICE_SHARE = 7 / 8;
@@ -242,22 +250,24 @@ class Bucket {
     this.refill();
     this.tokens -= n;
   }
-
 }
 
 /** Buckets by client address. A bucket is forgotten once it has refilled, since a full
  *  bucket is what a new address gets anyway, so reconnecting buys no fresh burst. */
 class AddressBudgets {
-  constructor(clock, rate) {
+  constructor(clock, rate, burst = rate * 2) {
     this.clock = clock;
     this.rate = rate;
+    this.burst = burst;
     this.map = new Map();
   }
+
+  has(addr) { return this.map.has(addr); }
 
   get(addr) {
     let b = this.map.get(addr);
     if (!b) {
-      this.map.set(addr, b = new Bucket(this.clock, this.rate));
+      this.map.set(addr, b = new Bucket(this.clock, this.rate, this.burst));
       this.retire(addr, b);
     }
     return b;
@@ -333,8 +343,11 @@ function ipv6Groups(ip) {
 // UDP (`--stun`), and a seedkernel transport asks the relay a peer is linked through,
 // so nodes need no third-party STUN server: the relay already sees every address it
 // would tell. It answers Binding requests and nothing else, at most STUN_RATE a second to
-// one address, which leaves it of little use as a reflector.
-const STUN_COOKIE = 0x2112a442, STUN_RATE = 20;
+// one address, which leaves it of little use as a reflector. Each address it answers is
+// remembered for a second or so, and UDP sources are easy to forge, so it takes at most
+// STUN_NEW_RATE new addresses a second: a flood of forged ones goes unanswered, not
+// remembered, while addresses already known keep their own rate.
+const STUN_COOKIE = 0x2112a442, STUN_RATE = 20, STUN_NEW_RATE = 256;
 
 /** The Binding success response to a STUN Binding request from `ip`:`port`, carrying its
  *  XOR-MAPPED-ADDRESS; null for anything else. */
@@ -373,8 +386,8 @@ export function stunResponse(msg, ip, port) {
 //                                                 0x04 left      [room 32][pk 32]
 //                                                 0x07 refused   [room 32]
 //
-// A join is answered with the room's other keys, over one or more members frames, or
-// refused when the room has no seat for the socket.
+// A join is answered with the room's other keys in a members frame, or refused when the
+// room has no seat for the socket or its address is joining too fast.
 const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_MEMBERS = 0x02, T_JOINED = 0x03,
   T_LEFT = 0x04, T_CALL = 0x05, T_UNREACHABLE = 0x06, T_REFUSED = 0x07;
 const T_JOIN = 0x02, T_LEAVE = 0x03;
@@ -449,11 +462,11 @@ const closeFrame = (code) => encodeFrame(0x8, Buffer.of(code >> 8, code & 255));
 
 // ─── client frames ─────────────────────────────────────────────────────────
 //
-// Both kinds of socket read client frames with one parser and one set of rules: RSV
-// bits clear, a mask (RFC 6455 requires one from a client), lengths in their shortest
-// encoding, control frames final and at most 125 bytes. A control socket takes whole
-// binary frames up to MAX_CONTROL_PAYLOAD; a splice takes any data frame, fragments and
-// all, of any size.
+// Every socket reads client frames with one parser and one set of rules: RSV bits clear,
+// a mask (RFC 6455 requires one from a client), lengths in their shortest encoding,
+// control frames final and at most 125 bytes. A control or room socket takes whole binary
+// frames up to MAX_CONTROL_PAYLOAD; a splice takes any data frame, fragments and all, of
+// any size.
 const CONTROL_FRAMES = { opcodes: [0x2, 0x8, 0x9, 0xA], whole: true, maxLen: MAX_CONTROL_PAYLOAD };
 const SPLICE_FRAMES = { opcodes: [0x0, 0x1, 0x2, 0x8, 0x9, 0xA], whole: false, maxLen: Number.MAX_SAFE_INTEGER };
 
@@ -548,18 +561,22 @@ class FrameReader {
 
 // ─── rooms ─────────────────────────────────────────────────────────────────
 //
-// A registered control socket holds a seat in each room it joined, up to
-// MAX_ROOMS_PER_CONN at once. A room's members are the distinct keys seated in it, so a
-// node on two sockets is one member. A joiner is never turned away for what announcing it
-// costs: the registration rate bounds how often any one address can make a room announce.
+// A registered room socket holds a seat in each room it joined, up to MAX_ROOMS_PER_CONN
+// at once. A room's members are the distinct keys seated in it, so a key on two sockets
+// is one member. A joiner is never turned away for what announcing it costs: an address
+// joins rooms at the registration rate, after a burst of JOIN_BURST, which bounds how
+// often it can make a room announce however it leaves and joins again.
 const MAX_ROOMS_PER_CONN = 16;
+// Two sockets' worth of rooms at once, so an app redialing a relay joins all of its
+// rooms again, and a second tab too.
+const JOIN_BURST = 2 * MAX_ROOMS_PER_CONN;
 
 class Room {
   constructor(relay, id) {
     this.relay = relay;
     this.id = id;              // hex
     this.idBytes = Buffer.from(id, "hex");
-    this.conns = new Set();    // the control sockets seated here
+    this.conns = new Set();    // the room sockets seated here
   }
 
   seats(addr) {
@@ -580,10 +597,7 @@ class Room {
     for (const c of this.conns) if (c.key !== conn.key) known.set(c.key, c.pk);
     const already = this.holds(conn.key);
     this.conns.add(conn);
-    const keys = [...known.values()];
-    for (let i = 0; i === 0 || i < keys.length; i += MAX_KEYS_PER_FRAME) {
-      if (!conn.send(typed(T_MEMBERS, this.idBytes, ...keys.slice(i, i + MAX_KEYS_PER_FRAME)))) return false;
-    }
+    if (!conn.send(typed(T_MEMBERS, this.idBytes, ...known.values()))) return false;
     if (!already) this.tell(T_JOINED, conn);
     return true;
   }
@@ -601,7 +615,7 @@ class Room {
   }
 }
 
-// ─── control sockets ───────────────────────────────────────────────────────
+// ─── control and room sockets ──────────────────────────────────────────────
 
 class ControlConn {
   constructor(relay, sock, addr, authority, forRooms) {
@@ -706,7 +720,8 @@ class ControlConn {
     const refusal = this.rooms.size >= MAX_ROOMS_PER_CONN ? "rooms per socket"
       : !room && relay.rooms.size >= limits.maxRooms ? `room table full (${relay.rooms.size} rooms)`
       : room && room.conns.size >= limits.maxPerRoom ? "room full"
-      : room && room.seats(this.addr) >= limits.maxPerRoomIp ? "per-ip room cap" : null;
+      : room && room.seats(this.addr) >= limits.maxPerRoomIp ? "per-ip room cap"
+      : relay.joins && !relay.joins.get(this.addr).spend(1) ? "join rate" : null;
     if (refusal) {
       relay.log(`! refused join: ${refusal}`);
       return this.send(typed(T_REFUSED, idBytes));
@@ -778,7 +793,6 @@ class Splice {
     this.ends = { caller: null, callee: null };
     this.live = 0;                       // sockets that came and have not closed
     this.over = false;                   // joined or expired: its tickets are spent
-    this.released = false;
     relay.pending.set(ticket, { splice: this, role: "caller" });
     relay.pending.set(this.calleeTicket, { splice: this, role: "callee" });
     bump(relay.callsFrom, from, 1);
@@ -813,9 +827,8 @@ class Splice {
     for (const end of Object.values(this.ends)) end?.sock.destroy();
   }
 
+  /** Called once, when it is over and its last socket gone: nothing attaches once over. */
   release() {
-    if (this.released) return;
-    this.released = true;
     bump(this.relay.splicesTo, this.pair, -1);
   }
 
@@ -946,14 +959,9 @@ function targetFromUrl(url) {
 
 // A relay with secrets takes a registration only with the MAC
 //   BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret)
-// after its signature. BLAKE2b cannot be length-extended, so hashing the secret in is a
-// MAC without HMAC's wrapping, and it is the one hash every party already has: Node here,
-// seedkernel's `crypto/blake2b` in the transport, libsodium in apps. Unkeyed, as Node has
-// no keyed BLAKE2b. The signature covers the socket's kind, the authority and the nonce,
-// so the MAC is bound to them too, and cannot be moved to another socket or key. A relay
-// without secrets ignores a MAC, so a client given a secret still registers on an open
-// relay. A client proves a secret only to the relay it was given for: seedkernel's
-// transport sends no MAC to a relay it only calls a peer through.
+// after its signature, which binds it to the socket's nonce and key. BLAKE2b cannot be
+// length-extended, so hashing the secret in makes a MAC; unkeyed, as Node has no keyed
+// BLAKE2b. A relay without secrets ignores a MAC. The README's wire section has the rest.
 function secretProof(secret, pk, sig) {
   return createHash("blake2b512").update(DOMAIN_SECRET).update(pk).update(sig).update(secret).digest();
 }
@@ -994,8 +1002,10 @@ class Relay {
     this.incomingFrames = new Bucket(clock, 8192);
     const { registerRate, spliceRate, heartbeatSecs } = this.limits;
     this.registrations = registerRate > 0 ? new AddressBudgets(clock, registerRate) : null;
+    this.joins = registerRate > 0 ? new AddressBudgets(clock, registerRate, Math.max(2 * registerRate, JOIN_BURST)) : null;
     this.spliceBudgets = spliceRate > 0 ? new AddressBudgets(clock, spliceRate * 1024) : null;
     this.stunBudgets = new AddressBudgets(clock, STUN_RATE);
+    this.stunNewAddresses = new Bucket(clock, STUN_NEW_RATE);
 
     // NAT and firewall timeouts leave half-open sockets that never emit 'close', so
     // without a liveness probe a dropped peer would hold its room and address slots
@@ -1011,7 +1021,7 @@ class Relay {
 
     this.server = createServer((_req, res) => {
       res.writeHead(426, { "Content-Type": "text/plain", "Connection": "close" });
-      res.end("seedkernel relay: connect with ws://<host>:<port>/<room>\n");
+      res.end("seedrelay: connect a WebSocket to ws://<host>:<port>/v1/\n");
     });
     this.server.on("connection", (sock) => this.connection(sock));
     this.server.on("upgrade", (req, sock, head) => this.upgrade(req, sock, head));
@@ -1176,7 +1186,10 @@ class Relay {
   /** The answer to a datagram on the STUN port from `address`:`port`, or null. */
   stun(msg, address, port) {
     const ip = normalizeIp(address);
-    if (!ip || !this.stunBudgets.get(addressKey(ip, this.limits.ipv6Prefix)).spend(1)) return null;
+    if (!ip) return null;
+    const addr = addressKey(ip, this.limits.ipv6Prefix);
+    if (!this.stunBudgets.has(addr) && !this.stunNewAddresses.spend(1)) return null;
+    if (!this.stunBudgets.get(addr).spend(1)) return null;
     return stunResponse(msg, ip, port);
   }
 

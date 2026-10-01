@@ -10,18 +10,19 @@
 //   --allow-origin ORIGIN  allow this Origin (repeatable; replaces the localhost defaults)
 //   --max-conns N          total concurrent sockets        (env RELAY_MAX_CONNS)
 //   --max-rooms N          total concurrent rooms          (env RELAY_MAX_ROOMS)
-//   --max-per-room N       registered sockets per room     (env RELAY_MAX_PER_ROOM)
+//   --max-per-room N       registered sockets per room, at most 1024
+//                                                          (env RELAY_MAX_PER_ROOM)
 //   --max-per-ip N         sockets per client address      (env RELAY_MAX_PER_IP)
 //   --max-per-room-ip N    sockets per address in one room (env RELAY_MAX_PER_ROOM_IP)
 //   --ipv6-prefix N        IPv6 bits that name one client  (env RELAY_IPV6_PREFIX)
-//   --register-rate N      control sockets an address opens per second, 0=unmetered
-//                                                          (env RELAY_REGISTER_RATE)
+//   --register-rate N      sockets an address registers, and rooms it joins, per second,
+//                          0=unmetered                     (env RELAY_REGISTER_RATE)
 //   --splice-rate N        KiB/s an address sends through splices, 0=unmetered
 //                                                          (env RELAY_SPLICE_RATE)
 //   --heartbeat-secs N     ping/reap interval, 0=off       (env RELAY_HEARTBEAT_SECS)
 //   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
-//   --secret SECRET        register only nodes and apps given this secret, 16+ characters
-//                          (repeatable; env RELAY_SECRETS, which keeps it out of `ps`)
+//   --secret SECRET        register only nodes and apps given this secret, 16+ characters,
+//                          no commas (repeatable; env RELAY_SECRETS, which keeps it out of `ps`)
 //   --stun [HOST:]PORT     answer STUN on this UDP port, on --host unless named (env RELAY_STUN)
 
 import { createSocket } from "node:dgram";
@@ -55,7 +56,7 @@ relay.server.listen(options.port, host, () => {
   const port = relay.server.address().port;
   if (relay.authorities.size === 0) for (const name of localAuthorities(host, port)) relay.authorities.add(name);
   const l = relay.limits;
-  console.log(`seedrelay listening on ws://${bracket(host)}:${port}/<room>`);
+  console.log(`seedrelay listening on ws://${bracket(host)}:${port}/v1/`);
   console.log(`  answers to: ${[...relay.authorities].join(", ")}`);
   console.log(`  origin allowlist: ${[...relay.origins].slice(0, 4).join(", ")}…`);
   console.log(`  registration: ${relay.secrets.length ? `needs a secret (${relay.secrets.length} accepted)` : "open to any key"}`);

@@ -241,6 +241,9 @@ test("a relay with a secret registers only nodes and apps that prove it, without
   const open = fixture(), given = open.member({ secret });
   assert.equal(ofType(given, 0x01).length, 1, "a relay with no secret ignores a MAC");
   assert.throws(() => parseOptions(["--secret", "too short"]), /at least 16/);
+  for (const unread of [`${secret},${other}`, ` ${secret}`, `${secret}\n`]) {
+    assert.throws(() => parseOptions(["--secret", unread]), /no commas/, "as RELAY_SECRETS or a file could not give it");
+  }
   assert.deepEqual(parseOptions([], { RELAY_SECRETS: `${secret}, ${other}` }).secrets, [secret, other]);
 });
 
@@ -252,7 +255,7 @@ test("with no --authority a relay answers to the names of the address it is boun
 
 test("malformed or unknown options fail at startup instead of falling back", () => {
   for (const args of [["--max-conns", "lots"], ["--max-conns", "-1"], ["--max-conns", "1.5"], ["--max-conns"],
-    ["--ipv6-prefix", "129"], ["--port", "70000"], ["--frobnicate"], ["--trust-proxy"],
+    ["--ipv6-prefix", "129"], ["--port", "70000"], ["--max-per-room", "1025"], ["--frobnicate"], ["--trust-proxy"],
     ["--trusted-proxy", "bogus"], ["--authority", "wss://relay.example"]]) {
     assert.throws(() => parseOptions(args), Error, args.join(" "));
   }
@@ -340,17 +343,6 @@ test("one socket joins and leaves several rooms", () => {
   for (let i = 0; i < 16; i++) a.emit("data", joinRoom(`r${i}`));
   assert.deepEqual(typed(a).at(-1), roomFrame(0x07, "r15"), "a seventeenth room is refused");
   assert.equal(a.destroyed, false, "and only the join");
-});
-
-test("a room too big for one frame is sent over several", () => {
-  const f = fixture(["--max-conns", "3000", "--max-per-room", "2000", "--max-per-ip", "3000",
-    "--max-per-room-ip", "2000", "--register-rate", "0"]);
-  const ids = Array.from({ length: 1025 }, () => identity());
-  for (const id of ids) f.roomMember({}, id);
-  const s = f.roomMember();
-  const members = ofType(s, 0x02);
-  assert.deepEqual(members.map((p) => (p.length - 33) / 32), [1024, 1]);
-  assert.deepEqual(members[1].subarray(33), ids[1024].pk);
 });
 
 test("a call rings only the callee, with a ticket of its own, and joins the two ends", () => {
@@ -518,6 +510,15 @@ test("STUN: a Binding request learns the address it came from, and nothing else 
   let answered = 0;
   for (let i = 0; i < 100; i++) if (f.relay.stun(binding(), "192.0.2.8", 7)) answered++;
   assert.equal(answered, 40, "at most two seconds' worth to one address");
+
+  // Forged sources are taken at most STUN_NEW_RATE a second, two seconds' worth at once,
+  // so a flood of them is not remembered; an address already known is still answered.
+  const g = fixture(), known = "198.51.100.1";
+  g.relay.stun(binding(), known, 7);
+  let fresh = 0;
+  for (let i = 0; i < 1000; i++) if (g.relay.stun(binding(), `10.0.${i >> 8}.${i & 255}`, 7)) fresh++;
+  assert.equal(fresh, 511);
+  assert.ok(g.relay.stun(binding(), known, 7));
 });
 
 test("one address takes only a few of a room's seats: past them a join is refused, not the socket", () => {
@@ -694,6 +695,21 @@ test("an address opens control sockets at the registration rate", () => {
   assert.equal(f.join().destroyed, false, "and the rate refills");
 });
 
+test("an address joins rooms at the registration rate, so leaving and joining again cannot make a room announce", () => {
+  const f = fixture(["--register-rate", "1"]);
+  const app = f.roomMember({ room: null }), seated = f.roomMember({}, identity(), "192.0.2.7");
+  for (let i = 0; i < 40; i++) {
+    app.emit("data", joinRoom("room"));
+    app.emit("data", leaveRoom("room"));
+  }
+  assert.equal(ofType(seated, 0x03).length, 32, "two sockets' worth of rooms at once");
+  assert.equal(ofType(app, 0x07).length, 8, "then each join past it is refused");
+  assert.equal(app.destroyed, false, "and only the join");
+  f.advance(1000);
+  app.emit("data", joinRoom("room"));
+  assert.equal(ofType(seated, 0x03).length, 33, "and the rate refills");
+});
+
 test("closing the relay tells every socket it is restarting", () => {
   const f = fixture(), a = f.member(), b = f.member(), handshaking = f.tcp();
   const [sa, sb] = f.splice(a, b);
@@ -728,22 +744,29 @@ test("a registration split across the upgrade head and later reads is accepted",
   assert.equal(typed(s)[1][0], 0x01);
 });
 
-test("real sockets: register, call and splice through a running relay", { timeout: 10000 }, async (t) => {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
-  const child = spawn(process.execPath, [SERVER, "0", "--stun", "127.0.0.1:0"],
-    { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+/** Run the bin on a free port with `args` and `env`, and none of this shell's RELAY_
+ *  variables, until its banner is out and it has printed each of `more`: what it printed,
+ *  and the port it listens on. */
+async function startRelay(t, args = [], env = {}, ...more) {
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
+  const child = spawn(process.execPath, [SERVER, "0", ...args],
+    { env: { ...clean, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   t.after(() => child.kill());
-  const [port, stunPort] = await new Promise((resolve, reject) => {
+  const output = await new Promise((resolve, reject) => {
     let output = "";
     child.stdout.on("data", (data) => {
       output += data;
-      const ws = /listening on ws:\/\/127\.0\.0\.1:(\d+)\//.exec(output);
-      const udp = /STUN on udp:\/\/127\.0\.0\.1:(\d+)/.exec(output);
-      if (ws && udp) resolve([Number(ws[1]), Number(udp[1])]);
+      if ([/heartbeat: /, ...more].every((re) => re.test(output))) resolve(output);
     });
     child.once("error", reject);
     child.once("exit", (code) => reject(new Error(`server exited ${code}`)));
   });
+  return { output, port: Number(/listening on ws:\/\/127\.0\.0\.1:(\d+)\/v1\//.exec(output)[1]) };
+}
+
+test("real sockets: register, call and splice through a running relay", { timeout: 10000 }, async (t) => {
+  const { output, port } = await startRelay(t, ["--stun", "127.0.0.1:0"], {}, /STUN on udp/);
+  const stunPort = Number(/STUN on udp:\/\/127\.0\.0\.1:(\d+)/.exec(output)[1]);
   const open = (path) => new Promise((resolve, reject) => {
     const req = request({ host: "127.0.0.1", port, path, headers: {
       Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13",
@@ -808,20 +831,8 @@ test("real sockets: register, call and splice through a running relay", { timeou
 
 test("real sockets: rooms.mjs proves the secret of a relay started with one", { timeout: 10000 }, async (t) => {
   const secret = "correct horse battery";
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
-  const child = spawn(process.execPath, [SERVER, "0"], { env: { ...env, RELAY_SECRETS: secret },
-    stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-  t.after(() => child.kill());
-  const port = await new Promise((resolve, reject) => {
-    let output = "";
-    child.stdout.on("data", (data) => {
-      output += data;
-      const ws = /listening on ws:\/\/127\.0\.0\.1:(\d+)\//.exec(output);
-      if (ws && /registration: needs a secret/.test(output)) resolve(Number(ws[1]));
-    });
-    child.once("error", reject);
-    child.once("exit", (code) => reject(new Error(`server exited ${code}`)));
-  });
+  const { output, port } = await startRelay(t, [], { RELAY_SECRETS: secret });
+  assert.match(output, /registration: needs a secret/);
   const heard = [];
   const client = (id) => {
     const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key), secret,

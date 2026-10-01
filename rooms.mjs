@@ -56,7 +56,8 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
     for (const key of keys ?? []) onMember(wanted.get(id), key, false);
   };
 
-  async function onMessage(m) {
+  /** A message on `sock`, which by the time a signature is made may no longer be `ws`. */
+  async function onMessage(sock, m) {
     const type = m[0], body = m.subarray(1);
     if (type === T_CHALLENGE && body.length === NONCE_LEN && !registered) {
       const sig = new Uint8Array(await sign(concat(DOMAIN_ROOMS, utf8(authority), body)));
@@ -64,7 +65,7 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
       // which a listener cannot reuse, since the signature is over this socket's nonce.
       const mac = secret === null ? new Uint8Array(0)
         : new Uint8Array(await blake2b(concat(DOMAIN_SECRET, publicKey, sig, utf8(secret))));
-      ws.send(concat(Uint8Array.of(T_REGISTER), publicKey, sig, mac));
+      sock.send(concat(Uint8Array.of(T_REGISTER), publicKey, sig, mac));
     } else if (type === T_REGISTER && !registered) {
       registered = true;
       retryMs = RETRY_MS;
@@ -89,10 +90,10 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
 
   function connect() {
     timer = null;
-    ws = new WebSocket(`${url.protocol}//${url.host}/v1/rooms`);
-    ws.binaryType = "arraybuffer";
-    ws.onmessage = (e) => { void onMessage(new Uint8Array(e.data)).catch(() => ws.close()); };
-    ws.onclose = () => {
+    const sock = ws = new WebSocket(`${url.protocol}//${url.host}/v1/rooms`);
+    sock.binaryType = "arraybuffer";
+    sock.onmessage = (e) => { void onMessage(sock, new Uint8Array(e.data)).catch(() => sock.close()); };
+    sock.onclose = () => {
       registered = false;
       for (const id of [...heard.keys()]) forget(id);
       if (closed) return;
