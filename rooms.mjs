@@ -2,10 +2,11 @@
 // hands the ones it meets to its seedkernel transport as `relay+` addresses, which the
 // transport reaches through its own control socket. Rooms are discovery only; the
 // transport knows nothing of them. Browser and Node alike: it needs WebSocket, WebCrypto's
-// SHA-256, and a way to sign with the node's key.
+// SHA-256, and a way to sign with the node's key; on a private relay, BLAKE2b too.
 
 const utf8 = (s) => new TextEncoder().encode(s);
 const DOMAIN_ROOMS = utf8("seedrelay-rooms-v1\0");
+const DOMAIN_SECRET = utf8("seedrelay-secret-v1\0");
 const ROOM_TAG = utf8("seedrelay-room-v1\0");
 const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_JOIN = 0x02, T_LEAVE = 0x03,
   T_MEMBERS = 0x02, T_JOINED = 0x03, T_LEFT = 0x04, T_REFUSED = 0x07;
@@ -32,10 +33,15 @@ export async function roomId(name) {
 
 /** Stay on the relay at `relay` (`ws[s]://host[:port]`) as `publicKey`, signing its
  *  challenges with `sign(message)` (the node's Ed25519 key, detached), and in the rooms
- *  `join` names. `onMember(room, keyHex, present)` hears each key as it comes and goes,
- *  and `onRefused(room)` a room the relay had no seat for, which is then left. A dropped
- *  relay is redialed and its rooms joined again. */
-export function roomClient({ relay, publicKey, sign, onMember, onRefused = () => {}, WebSocket = globalThis.WebSocket }) {
+ *  `join` names. A relay started with `--secret` takes only a client given that `secret`,
+ *  which it proves with a MAC and never sends; the MAC needs `blake2b(message)`, unkeyed
+ *  BLAKE2b-512, which browsers lack: `(m) => sodium.crypto_generichash(64, m)`.
+ *  `onMember(room, keyHex, present)` hears each key as it comes and goes, and
+ *  `onRefused(room)` a room the relay had no seat for, which is then left. A dropped relay
+ *  is redialed and its rooms joined again. */
+export function roomClient({ relay, publicKey, sign, secret = null, blake2b = null, onMember, onRefused = () => {},
+  WebSocket = globalThis.WebSocket }) {
+  if (secret !== null && typeof blake2b !== "function") throw new Error("roomClient: a secret needs blake2b");
   const url = new URL(relay);
   const authority = url.host.toLowerCase(); // a URL drops a default port, as the relay does
   const wanted = new Map();  // room id to its name
@@ -53,8 +59,12 @@ export function roomClient({ relay, publicKey, sign, onMember, onRefused = () =>
   async function onMessage(m) {
     const type = m[0], body = m.subarray(1);
     if (type === T_CHALLENGE && body.length === NONCE_LEN && !registered) {
-      const sig = await sign(concat(DOMAIN_ROOMS, utf8(authority), body));
-      ws.send(concat(Uint8Array.of(T_REGISTER), publicKey, sig));
+      const sig = new Uint8Array(await sign(concat(DOMAIN_ROOMS, utf8(authority), body)));
+      // With a secret, BLAKE2b-512 over the signature and it: proof the relay can check,
+      // which a listener cannot reuse, since the signature is over this socket's nonce.
+      const mac = secret === null ? new Uint8Array(0)
+        : new Uint8Array(await blake2b(concat(DOMAIN_SECRET, publicKey, sig, utf8(secret))));
+      ws.send(concat(Uint8Array.of(T_REGISTER), publicKey, sig, mac));
     } else if (type === T_REGISTER && !registered) {
       registered = true;
       retryMs = RETRY_MS;

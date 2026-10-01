@@ -57,17 +57,18 @@ function fixture(args = []) {
     return s;
   }
   const join = (options, address) => upgrade(tcp(address), options);
-  /** A control socket that has registered `id` (a fresh one by default). */
-  function member(options = {}, id = identity(), address) {
+  /** A control socket that has registered `id` (a fresh one by default), proving `secret`
+   *  if given. */
+  function member({ secret, ...options } = {}, id = identity(), address) {
     const s = join(options, address);
-    s.emit("data", frame(2, registration(id, "relay.test", challenge(s))));
+    s.emit("data", frame(2, registration(id, "relay.test", challenge(s), secret)));
     s.id = id;
     return s;
   }
   /** A room socket that has registered `id` and joined `room`, or no room for null. */
-  function roomMember({ room = "room", ...options } = {}, id = identity(), address) {
+  function roomMember({ room = "room", secret, ...options } = {}, id = identity(), address) {
     const s = join({ path: "/v1/rooms", ...options }, address);
-    s.emit("data", frame(2, roomRegistration(id, "relay.test", challenge(s))));
+    s.emit("data", frame(2, roomRegistration(id, "relay.test", challenge(s), secret)));
     if (room !== null) s.emit("data", joinRoom(room));
     s.id = id;
     return s;
@@ -135,14 +136,22 @@ function identity() {
   return { pk: publicKey.export({ format: "der", type: "spki" }).subarray(12), key: privateKey };
 }
 const DOMAINS = Buffer.from("seedkernel-link-scope-v1\0seedkernel-relay-register-v1\0");
-function registration(id, authority, nonce) {
+/** A control socket's registration, with its MAC under `secret` when one is given. */
+function registration(id, authority, nonce, secret) {
   const sig = sign(null, Buffer.concat([DOMAINS, Buffer.from(authority), nonce]), id.key);
-  return Buffer.concat([Buffer.of(1), id.pk, sig]);
+  return Buffer.concat([Buffer.of(1), id.pk, sig, secretMac(secret, id.pk, sig)]);
 }
 /** A room socket's registration: the app signs under the rooms tag itself. */
-function roomRegistration(id, authority, nonce) {
+function roomRegistration(id, authority, nonce, secret) {
   const sig = sign(null, Buffer.concat([Buffer.from("seedrelay-rooms-v1\0"), Buffer.from(authority), nonce]), id.key);
-  return Buffer.concat([Buffer.of(1), id.pk, sig]);
+  return Buffer.concat([Buffer.of(1), id.pk, sig, secretMac(secret, id.pk, sig)]);
+}
+/** BLAKE2b-512, unkeyed: what libsodium's `crypto_generichash(64, m)` and seedkernel's
+ *  `crypto/blake2b` give. */
+const blake2b = (m) => createHash("blake2b512").update(m).digest();
+function secretMac(secret, pk, sig) {
+  if (secret === undefined) return Buffer.alloc(0);
+  return blake2b(Buffer.concat([Buffer.from("seedrelay-secret-v1\0"), pk, sig, Buffer.from(secret)]));
 }
 const call = (to, ticket) => frame(2, Buffer.concat([Buffer.of(5), to, ticket]));
 /** A room's id, as a node would name it: any 32 bytes do. */
@@ -187,6 +196,52 @@ test("a Host this relay does not answer to is refused, so no relay can pass anot
   const own = b.join({ headers: { host: "B.test:80" } });
   own.emit("data", frame(2, registration(visitor, "b.test", challenge(own))));
   assert.equal(ofType(own, 0x01).length, 1, "registered");
+});
+
+test("a relay with a secret registers only nodes and apps that prove it, without it crossing the wire", () => {
+  const secret = "correct horse battery", other = "another good secret";
+  const f = fixture(["--secret", secret, "--secret", other, "--register-rate", "0"]);
+  for (const kind of ["control", "rooms"]) {
+    const enrol = kind === "control" ? f.member : (options) => f.roomMember({ room: null, ...options });
+    assert.equal(enrol().destroyed, true, `${kind}: no MAC`);
+    assert.equal(enrol({ secret: "a wrong guess at it" }).destroyed, true, `${kind}: a MAC under another secret`);
+    assert.equal(ofType(enrol({ secret }), 0x01).length, 1, `${kind}: registered`);
+    assert.equal(ofType(enrol({ secret: other }), 0x01).length, 1, `${kind}: under either secret`);
+  }
+  assert.ok(f.logs.some((line) => line.includes("dropped: no secret")));
+  assert.equal(f.logs.join("\n").includes(secret), false);
+
+  // A listener who saw a registration cannot move its MAC to another socket or key.
+  const seen = f.join(), a = identity(), b = identity();
+  const heard = registration(a, "relay.test", challenge(seen), secret);
+  seen.emit("data", frame(2, heard));
+  const mac = heard.subarray(97);
+  const replay = f.join();
+  replay.emit("data", frame(2, heard));
+  assert.equal(replay.destroyed, true, "the same registration on another socket");
+  const moved = f.join();
+  moved.emit("data", frame(2, Buffer.concat([registration(b, "relay.test", challenge(moved)), mac])));
+  assert.equal(moved.destroyed, true, "the MAC with another key's signature");
+  const cut = f.join();
+  cut.emit("data", frame(2, registration(a, "relay.test", challenge(cut), secret).subarray(0, 97 + 32)));
+  assert.equal(cut.destroyed, true, "a MAC cut to 32 bytes, as crypto_generichash(32, m) would give");
+
+  // The MAC is libsodium's BLAKE2b-512, as apps and the transport compute it: this vector
+  // is `crypto_generichash(64, "seedrelay-secret-v1\0" ‖ 0x11×32 ‖ 0x22×64 ‖ secret)`.
+  assert.equal(secretMac(secret, Buffer.alloc(32, 0x11), Buffer.alloc(64, 0x22)).toString("hex"),
+    "33fbb32be9fe6c16946bb35d6a343126de9c4858062f94037611f733156de4ed" +
+    "34753a899a7d808ad10f57f56307a96496c9918fb81da06ff14aa96de5cd5785");
+
+  // Splice sockets need only their tickets, which only registered sockets are given.
+  const caller = f.member({ secret }), callee = f.member({ secret });
+  const [sa, sb] = f.splice(caller, callee);
+  sa.emit("data", frame(2, Buffer.from("through")));
+  assert.deepEqual(typed(sb).at(-1), Buffer.from("through"));
+
+  const open = fixture(), given = open.member({ secret });
+  assert.equal(ofType(given, 0x01).length, 1, "a relay with no secret ignores a MAC");
+  assert.throws(() => parseOptions(["--secret", "too short"]), /at least 16/);
+  assert.deepEqual(parseOptions([], { RELAY_SECRETS: `${secret}, ${other}` }).secrets, [secret, other]);
 });
 
 test("with no --authority a relay answers to the names of the address it is bound to, if it has one", () => {
@@ -749,6 +804,40 @@ test("real sockets: register, call and splice through a running relay", { timeou
   while (!(saw(ha, hb, true) && saw(hb, ha, true))) await new Promise((r) => setTimeout(r, 10));
   await rb.leave("lobby");
   while (!saw(ha, hb, false)) await new Promise((r) => setTimeout(r, 10));
+});
+
+test("real sockets: rooms.mjs proves the secret of a relay started with one", { timeout: 10000 }, async (t) => {
+  const secret = "correct horse battery";
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
+  const child = spawn(process.execPath, [SERVER, "0"], { env: { ...env, RELAY_SECRETS: secret },
+    stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  t.after(() => child.kill());
+  const port = await new Promise((resolve, reject) => {
+    let output = "";
+    child.stdout.on("data", (data) => {
+      output += data;
+      const ws = /listening on ws:\/\/127\.0\.0\.1:(\d+)\//.exec(output);
+      if (ws && /registration: needs a secret/.test(output)) resolve(Number(ws[1]));
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`server exited ${code}`)));
+  });
+  const heard = [];
+  const client = (id) => {
+    const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key), secret,
+      blake2b, onMember: (room, key, present) => heard.push([id.pk.toString("hex"), key, present]),
+      WebSocket: TestWebSocket });
+    t.after(() => c.close());
+    return c;
+  };
+  assert.throws(() => roomClient({ relay: "ws://127.0.0.1:1", publicKey: Buffer.alloc(32), sign, secret }),
+    /a secret needs blake2b/);
+  const ida = identity(), idb = identity();
+  await client(ida).join("lobby");
+  await client(idb).join("lobby");
+  const [ha, hb] = [ida.pk.toString("hex"), idb.pk.toString("hex")];
+  const saw = (who, key) => heard.some(([w, k, p]) => w === who && k === key && p);
+  while (!(saw(ha, hb) && saw(hb, ha))) await new Promise((r) => setTimeout(r, 10));
 });
 
 /** Just enough of a browser WebSocket over node:http for rooms.mjs: binary messages in and

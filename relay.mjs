@@ -25,6 +25,12 @@
 // private room wants a name with 16+ random bytes. Reaching a node needs only its key,
 // since the node's own contact secret gates its handshake end to end.
 //
+// A relay started with a secret (`--secret`) serves only those who know it: both kinds
+// of registration must carry a MAC of the signature under the secret, so the secret
+// itself never crosses the wire, and a MAC a listener sees is good for that socket only.
+// Splice sockets need no proof of their own, since only registered sockets place and
+// take the calls that hand out tickets.
+//
 // A splice is set up by a call: the caller names the callee's key and a fresh ticket on
 // its control socket, the relay passes the callee a ticket of its own on the callee's
 // control socket only, and each end opens a splice socket with its ticket. The relay
@@ -36,7 +42,7 @@
 // command line. No third-party dependencies.
 
 import { createServer } from "node:http";
-import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify } from "node:crypto";
 import { isIP } from "node:net";
 
 // ─── limits ──────────────────────────────────────────────────────────────
@@ -77,7 +83,8 @@ const LIMIT_FLAGS = {
  *  plus `port` and `host`. Anything malformed or unknown throws: a relay that starts
  *  with a limit it was not given is worse than one that does not start. */
 export function parseOptions(argv, env = {}) {
-  const options = { port: 8080, host: "127.0.0.1", authorities: [], allowOrigins: [], trustedProxies: [], limits: {}, stun: null };
+  const options = { port: 8080, host: "127.0.0.1", authorities: [], allowOrigins: [], trustedProxies: [], secrets: [],
+    limits: {}, stun: null };
   const number = (flag, value, max) => {
     const n = Number(value);
     if (value === undefined || value === "" || !Number.isFinite(n) || n < 0 || n > max ||
@@ -92,6 +99,7 @@ export function parseOptions(argv, env = {}) {
   }
   for (const a of list(env.RELAY_AUTHORITIES)) options.authorities.push(authorityOption(a));
   for (const ip of list(env.RELAY_TRUSTED_PROXIES)) options.trustedProxies.push(proxyOption(ip));
+  for (const secret of list(env.RELAY_SECRETS)) options.secrets.push(secretOption(secret));
   const stun = (flag, value) => {
     const m = /^(?:\[?([^\]\s]+?)\]?:)?(\d+)$/.exec(value);
     if (!m) throw new Error(`${flag} takes [host:]port, not ${JSON.stringify(value)}`);
@@ -111,6 +119,7 @@ export function parseOptions(argv, env = {}) {
     else if (a === "--authority") options.authorities.push(authorityOption(value()));
     else if (a === "--allow-origin") options.allowOrigins.push(value());
     else if (a === "--trusted-proxy") options.trustedProxies.push(proxyOption(value()));
+    else if (a === "--secret") options.secrets.push(secretOption(value()));
     else if (a === "--stun") options.stun = stun(a, value());
     else if (/^\d+$/.test(a)) options.port = number("the port", a, 65535);
     else throw new Error(`unknown option ${a}`);
@@ -125,6 +134,15 @@ export function parseOptions(argv, env = {}) {
 function authorityOption(value) {
   if (!/^[^\s/?#@]+$/.test(value)) throw new Error(`--authority takes host[:port] as nodes dial it, not ${JSON.stringify(value)}`);
   return canonicalAuthority(value);
+}
+
+// A listener who saw one registration can test guesses at the secret against its MAC
+// offline, so a secret must be too long to guess.
+const MIN_SECRET_LEN = 16;
+
+function secretOption(value) {
+  if (value.length < MIN_SECRET_LEN) throw new Error(`a secret takes at least ${MIN_SECRET_LEN} characters`);
+  return value;
 }
 
 function proxyOption(value) {
@@ -156,9 +174,9 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // ─── safety limits ───────────────────────────────────────────────────────
 //
-// A node sends a registration (97 bytes) or a call (49): a frame past this is not the
-// wire. Splice frames are not measured, since the relay streams them through without
-// holding one whole.
+// A node sends a registration (97 bytes, 161 with a secret's MAC) or a call (49): a frame
+// past this is not the wire. Splice frames are not measured, since the relay streams them
+// through without holding one whole.
 const MAX_CONTROL_PAYLOAD = 256;
 // Every write to a control socket, including control frames, shares the same hard
 // backlog cap.
@@ -344,7 +362,7 @@ export function stunResponse(msg, ip, port) {
 // seedkernel identities, rooms 32-byte ids, tickets 16 random bytes.
 //
 //   relay → client                                client → relay
-//   0x00 challenge   [nonce 32]                   0x01 register  [pk 32][sig 64]
+//   0x00 challenge   [nonce 32]                   0x01 register  [pk 32][sig 64][mac 64]?
 //   0x01 registered
 //
 // then on a control socket                        on a room socket
@@ -360,7 +378,7 @@ export function stunResponse(msg, ip, port) {
 const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_MEMBERS = 0x02, T_JOINED = 0x03,
   T_LEFT = 0x04, T_CALL = 0x05, T_UNREACHABLE = 0x06, T_REFUSED = 0x07;
 const T_JOIN = 0x02, T_LEAVE = 0x03;
-const PK_LEN = 32, SIG_LEN = 64, NONCE_LEN = 32, TICKET_LEN = 16, ROOM_LEN = 32;
+const PK_LEN = 32, SIG_LEN = 64, MAC_LEN = 64, NONCE_LEN = 32, TICKET_LEN = 16, ROOM_LEN = 32;
 
 // A registration is an Ed25519 signature by the node's identity key over
 //   DOMAIN_link_scope ‖ DOMAIN_relay ‖ authority ‖ nonce       on a control socket
@@ -377,6 +395,7 @@ const PK_LEN = 32, SIG_LEN = 64, NONCE_LEN = 32, TICKET_LEN = 16, ROOM_LEN = 32;
 const DOMAIN_LINK_SCOPE = Buffer.from("seedkernel-link-scope-v1\0");
 const DOMAIN_RELAY = Buffer.from("seedkernel-relay-register-v1\0");
 const DOMAIN_ROOMS = Buffer.from("seedrelay-rooms-v1\0");
+const DOMAIN_SECRET = Buffer.from("seedrelay-secret-v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
 
 /** Lowercase, without a default port, so the Host a browser sends for
@@ -643,8 +662,10 @@ class ControlConn {
   /** False once the socket is torn down, which stops the read. */
   onMessage(payload) {
     const type = payload[0], body = payload.subarray(1);
-    if (type === T_REGISTER && body.length === PK_LEN + SIG_LEN && !this.key) {
-      return this.register(body.subarray(0, PK_LEN), body.subarray(PK_LEN));
+    if (type === T_REGISTER && (body.length === PK_LEN + SIG_LEN || body.length === PK_LEN + SIG_LEN + MAC_LEN) &&
+        !this.key) {
+      const sigEnd = PK_LEN + SIG_LEN;
+      return this.register(body.subarray(0, PK_LEN), body.subarray(PK_LEN, sigEnd), body.subarray(sigEnd));
     }
     const rooms = this.key && this.forRooms, calls = this.key && !this.forRooms;
     if (type === T_JOIN && body.length === ROOM_LEN && rooms) return this.join(body);
@@ -659,8 +680,13 @@ class ControlConn {
     return false;
   }
 
-  register(pk, sig) {
+  register(pk, sig, mac) {
     const { relay } = this;
+    if (!relay.admits(pk, sig, mac)) {
+      relay.log("! dropped: no secret");
+      this.sock.destroy();
+      return false;
+    }
     if (!verifyRegistration(this.forRooms, pk, sig, this.authority, this.nonce)) {
       relay.log("! dropped: bad registration");
       this.sock.destroy();
@@ -918,6 +944,20 @@ function targetFromUrl(url) {
 
 // ─── the relay ───────────────────────────────────────────────────────────
 
+// A relay with secrets takes a registration only with the MAC
+//   BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret)
+// after its signature. BLAKE2b cannot be length-extended, so hashing the secret in is a
+// MAC without HMAC's wrapping, and it is the one hash every party already has: Node here,
+// seedkernel's `crypto/blake2b` in the transport, libsodium in apps. Unkeyed, as Node has
+// no keyed BLAKE2b. The signature covers the socket's kind, the authority and the nonce,
+// so the MAC is bound to them too, and cannot be moved to another socket or key. A relay
+// without secrets ignores a MAC, so a client given a secret still registers on an open
+// relay. A client proves a secret only to the relay it was given for: seedkernel's
+// transport sends no MAC to a relay it only calls a peer through.
+function secretProof(secret, pk, sig) {
+  return createHash("blake2b512").update(DOMAIN_SECRET).update(pk).update(sig).update(secret).digest();
+}
+
 /** A relay: `server` is an HTTP server to listen with; `connection` and `upgrade` are its
  *  handlers, which a test may drive with its own sockets. `authorities` holds the
  *  host[:port] names nodes may register under, and can be filled in once the port is
@@ -927,7 +967,7 @@ export function createRelay(options = {}) {
 }
 
 class Relay {
-  constructor({ authorities = [], allowOrigins = [], trustedProxies = [], limits = {}, clock = realClock,
+  constructor({ authorities = [], allowOrigins = [], trustedProxies = [], secrets = [], limits = {}, clock = realClock,
     log = (line) => console.log(line) } = {}) {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.clock = clock;
@@ -935,6 +975,7 @@ class Relay {
     this.authorities = new Set(authorities.map(canonicalAuthority));
     this.origins = new Set(allowOrigins.length ? allowOrigins : LOCAL_ORIGINS);
     this.proxies = new Set(trustedProxies.map(proxyOption));
+    this.secrets = secrets.map((secret) => Buffer.from(secret));
 
     // Every accepted TCP socket, to `{ account, timer, conn }`: the address it is charged
     // to (none for a trusted proxy before its client is known), its handshake deadline,
@@ -1099,6 +1140,12 @@ class Relay {
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
     this.clock.clearTimeout(entry.timer);
+  }
+
+  /** Whether a registration's MAC shows it knows one of the secrets, if there are any. */
+  admits(pk, sig, mac) {
+    if (this.secrets.length === 0) return true;
+    return mac.length === MAC_LEN && this.secrets.some((secret) => timingSafeEqual(secretProof(secret, pk, sig), mac));
   }
 
   route(conn) {

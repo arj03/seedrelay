@@ -20,6 +20,8 @@
 //                                                          (env RELAY_SPLICE_RATE)
 //   --heartbeat-secs N     ping/reap interval, 0=off       (env RELAY_HEARTBEAT_SECS)
 //   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
+//   --secret SECRET        register only nodes and apps given this secret, 16+ characters
+//                          (repeatable; env RELAY_SECRETS, which keeps it out of `ps`)
 //   --stun [HOST:]PORT     answer STUN on this UDP port, on --host unless named (env RELAY_STUN)
 
 import { createSocket } from "node:dgram";
@@ -56,6 +58,7 @@ relay.server.listen(options.port, host, () => {
   console.log(`seedrelay listening on ws://${bracket(host)}:${port}/<room>`);
   console.log(`  answers to: ${[...relay.authorities].join(", ")}`);
   console.log(`  origin allowlist: ${[...relay.origins].slice(0, 4).join(", ")}…`);
+  console.log(`  registration: ${relay.secrets.length ? `needs a secret (${relay.secrets.length} accepted)` : "open to any key"}`);
   console.log(`  limits: ${l.maxConns} conns, ${l.maxRooms} rooms, ${l.maxPerRoom}/room, ${l.maxPerIp}/ip, ${l.maxPerRoomIp}/ip in a room, ` +
     `IPv6 by /${l.ipv6Prefix}, registrations ${l.registerRate > 0 ? `${l.registerRate}/s per ip` : "unmetered"}, ` +
     `splices ${l.spliceRate > 0 ? `${l.spliceRate} KiB/s per ip` : "unmetered"}${relay.proxies.size ? " (X-Forwarded-For trusted)" : ""}`);

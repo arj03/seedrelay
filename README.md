@@ -96,6 +96,7 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--splice-rate N` | `RELAY_SPLICE_RATE` | `1024` | KiB/s one client address may send through its splices; `0` leaves them unmetered. |
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
+| `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
 | `--stun [HOST:]PORT` | `RELAY_STUN` | off | Answer STUN Binding requests on this UDP port, on `--host` unless a host is named. Nodes ask a relay's port `3478`; see [STUN](#stun). |
 
 A malformed value or an unknown option stops the relay at startup, rather than leaving it
@@ -123,8 +124,8 @@ was given is refused with `404`, and a second socket for one ticket with `409`.
 
 Both kinds of socket carry binary frames whose first byte is the type. Keys are 32-byte
 seedkernel identities, rooms 32-byte ids, tickets 16 random bytes chosen by the caller.
-Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]` and
-`0x01` registered; then:
+Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`, or
+`[pk 32][sig 64][mac 64]` on a relay with a secret, and `0x01` registered; then:
 
 | Socket | Relay → client | | Client → relay | |
 | --- | --- | --- | --- | --- |
@@ -149,6 +150,15 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]` 
   that to B as `Host: a.example`, and draw the visitor's calls on B. Anything else
   before registering, or a bad signature, drops the socket. Calls for a key go to the
   control socket that registered it most recently.
+- **Secrets.** A relay started with `--secret` also wants the MAC
+  `BLAKE2b-512("seedrelay-secret-v1\0" ‖ pk ‖ sig ‖ secret)` after the signature, on both
+  kinds of socket, and drops one without it. BLAKE2b cannot be length-extended, so
+  hashing the secret in is a MAC with no HMAC around it, and every party already has
+  it: Node's `blake2b512`, libsodium's `crypto_generichash(64, m)`, and seedkernel's
+  `crypto/blake2b`. It is unkeyed, since Node has no keyed BLAKE2b, and all 64 bytes:
+  BLAKE2b-256 is another hash, not a shorter one. The secret itself never crosses the
+  wire, and since the signature covers the nonce, a MAC a listener sees is no good on
+  any other socket or with any other key. A relay without secrets ignores the MAC.
 - **Rooms.** A registered room socket joins rooms by id, up to 16 at once, and leaves
   them, as IRC's `/join` and `/part` do. `rooms.mjs` makes a room's id by hashing its
   name, SHA-256 of `"seedrelay-room-v1\0" ‖ name`, so the relay never learns names. A join gets the room's other keys,
@@ -201,7 +211,7 @@ when that access is intended. Native clients that send no `Origin` header, such 
 Control sockets carry a few small frames each; splices carry the traffic.
 
 - **Control frames** from a node are binary and capped at 256 bytes; the largest, a
-  registration, is 97. Text, fragmented frames and WebSocket extensions are
+  registration, is 97, or 161 with a secret's MAC. Text, fragmented frames and WebSocket extensions are
   unsupported. Both kinds of socket read frames with one parser and the same rules,
   lengths in their shortest encoding included.
 - **Backlog.** Every write to a control socket, including ping/pong, respects a 256 KiB
@@ -304,6 +314,27 @@ clients count toward the per-address cap immediately. Trusted proxies share only
 global cap at that stage, and each forwarded client is held to the per-address cap
 once its headers arrive. Apply connection and request limits at the proxy as well.
 
+### Private relays
+
+An open relay registers any key, so anyone who can reach it can splice two keys of
+their own and use it as a pipe, slowed only by the per-address limits. To serve only
+your own nodes and apps, start it with a secret and give them the same one:
+
+```sh
+openssl rand -hex 16 > relay.secret    # once; hand the same file's contents to clients
+RELAY_SECRETS=$(cat relay.secret) seedrelay 8080 --authority relay.example --trusted-proxy 127.0.0.1
+```
+
+Control and room sockets must then prove the secret when they register; splice
+sockets need only their tickets, which only registered sockets are handed. The proof is
+a MAC, so the secret stays private even over plain `ws://`. A listener who saw one
+registration can still test guesses at the secret offline, though, so use a random
+one, as above, not a password. To change it, start the relay with both old and new,
+move the clients over, then drop the old. Clients take it as
+[Joining a room](#joining-a-room) shows. A seedkernel node proves its secret only to the
+relay it was given for, never to another relay it calls a peer through, so no other
+relay can test guesses at it.
+
 ## Joining a room
 
 A seedkernel node registers on the relay through its transport bundle's host-only
@@ -338,6 +369,22 @@ whether it is registered; the room client redials its own socket and joins its r
 again. Linking is the app's too: a send dials, and the transport's `ready` operation
 dials every peer it has been given.
 
+On a [private relay](#private-relays), pass the relay's secret to both. The transport's
+`relay` operation takes it as a second text after the URL, and `roomClient` takes it with
+the BLAKE2b that browsers lack, from the libsodium the app already signs with:
+
+```js
+await shell.call("_net", new OpArgs("relay").text(relay).text(secret).build());
+const rooms = roomClient({
+  relay, publicKey, sign: (m) => sodium.crypto_sign_detached(m, privateKey),
+  secret, blake2b: (m) => sodium.crypto_generichash(64, m),
+  onMember: /* … */,
+});
+```
+
+A node run from seedkernel's command line names a file holding the secret instead,
+with `--relay-secret`.
+
 ## What's here
 
 | Path | What it is |
@@ -369,6 +416,8 @@ dials every peer it has been given.
 - **Startup fails.** An option is malformed or unknown; the relay names it.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,
   exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff.
+- **A node or app never registers, and the relay logs `! dropped: no secret`.** The
+  relay was started with `--secret`, and the client has none or another one.
 - **A node never registers.** The relay logs `! dropped: bad registration`: the node
   signed for another authority than the `Host` the relay saw, which happens when a
   proxy rewrites `Host` to another of the relay's names. Forward the original `Host`.
