@@ -38,7 +38,9 @@ export async function roomId(name) {
  *  BLAKE2b-512, which browsers lack: `(m) => sodium.crypto_generichash(64, m)`.
  *  `onMember(room, keyHex, present)` hears each key as it comes and goes, and
  *  `onRefused(room)` a room the relay had no seat for, which is then left. A dropped relay
- *  is redialed and its rooms joined again. */
+ *  is redialed and its rooms joined again. Who is in a room stays as last heard while the
+ *  relay is away: the keys have not gone anywhere, and one that has is heard leaving once
+ *  the room is joined again. */
 export function roomClient({ relay, publicKey, sign, secret = null, blake2b = null, onMember, onRefused = () => {},
   WebSocket = globalThis.WebSocket }) {
   if (secret !== null && typeof blake2b !== "function") throw new Error("roomClient: a secret needs blake2b");
@@ -49,7 +51,7 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
   let ws = null, registered = false, closed = false, retryMs = RETRY_MS, timer = null;
 
   const send = (type, body) => { if (registered) ws.send(concat(Uint8Array.of(type), body)); };
-  const ask = (id) => { heard.set(id, new Set()); send(T_JOIN, fromHex(id)); };
+  const ask = (id) => { if (!heard.has(id)) heard.set(id, new Set()); send(T_JOIN, fromHex(id)); };
   const forget = (id) => {
     const keys = heard.get(id);
     heard.delete(id);
@@ -74,6 +76,12 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
         body.length >= ID_LEN && (body.length - ID_LEN) % 32 === 0) {
       const id = hex(body.subarray(0, ID_LEN)), keys = heard.get(id);
       if (!keys) return; // a room left since
+      if (type === T_MEMBERS) {
+        // The room as it stands: a key heard before a redial that is not in it has left.
+        const there = new Set();
+        for (let off = ID_LEN; off < body.length; off += 32) there.add(hex(body.subarray(off, off + 32)));
+        for (const key of [...keys]) if (!there.has(key) && keys.delete(key)) onMember(wanted.get(id), key, false);
+      }
       for (let off = ID_LEN; off < body.length; off += 32) {
         const key = hex(body.subarray(off, off + 32));
         const changed = type === T_LEFT ? keys.delete(key) : !keys.has(key) && keys.add(key);
@@ -82,7 +90,7 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
     } else if (type === T_REFUSED && body.length === ID_LEN) {
       const id = hex(body), name = wanted.get(id);
       if (!heard.has(id)) return;
-      heard.delete(id);
+      forget(id);
       wanted.delete(id);
       onRefused(name);
     }
@@ -95,7 +103,6 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
     sock.onmessage = (e) => { void onMessage(sock, new Uint8Array(e.data)).catch(() => sock.close()); };
     sock.onclose = () => {
       registered = false;
-      for (const id of [...heard.keys()]) forget(id);
       if (closed) return;
       timer = setTimeout(connect, retryMs * (1 + Math.random()) / 2);
       retryMs = Math.min(2 * retryMs, RETRY_MAX_MS);
