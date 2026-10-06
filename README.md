@@ -21,7 +21,7 @@ and how much they send until they move to a direct link.
 
 This lives outside the seedkernel repo because a relay is a deployment concern, not
 trusted runtime surface: the kernel ships no server, and its own tests use an
-in-process relay. [seedchat](https://github.com/arj03/seedchat) and
+in-process relay. [seedshell](https://github.com/arj03/seedshell) and
 [seedstore](https://github.com/arj03/seedstore) both use it.
 
 **Contents:** [Quick start](#quick-start) · [Running the server](#running-the-server) ·
@@ -42,7 +42,7 @@ layout is:
 some-dir/
 ├── seedkernel/
 ├── seedrelay/    ← this repo
-├── seedchat/
+├── seedshell/
 └── seedstore/
 ```
 
@@ -54,7 +54,7 @@ npm test
 ```
 
 When installed as a dependency, the `seedrelay` bin runs the same server, which is
-how seedchat's `npm run relay` starts it:
+how seedshell's `npm run relay` starts it:
 
 ```sh
 npx seedrelay 8080
@@ -316,6 +316,42 @@ clients count toward the per-address cap immediately. Trusted proxies share only
 global cap at that stage, and each forwarded client is held to the per-address cap
 once its headers arrive. Apply connection and request limits at the proxy as well.
 
+### Without a reverse proxy
+
+A server that has a certificate and no proxy can run `scripts/https-front.mjs` in a
+proxy's place: one Node process, with no dependencies, that serves a page's files over
+HTTPS and passes WebSocket upgrades under `/v1/` to the relay. It takes any port, so it
+fits beside whatever already holds 80 and 443:
+
+```sh
+sudo node scripts/https-front.mjs --cert /etc/letsencrypt/live/relay.example/fullchain.pem \
+  --key /etc/letsencrypt/live/relay.example/privkey.pem \
+  --root ../seedshell/browser --index shell.html
+
+seedrelay 8080 --authority relay.example:8443 --trusted-proxy 127.0.0.1 \
+  --allow-origin https://relay.example:8443 --stun 0.0.0.0:3478
+```
+
+Then `https://relay.example:8443/` is the page and `wss://relay.example:8443` the relay,
+which is where a seedshell page served over HTTPS looks for it. Open TCP 8443 and UDP 3478.
+
+The front listens on `8443` unless given `--port`, serves `--root` with `index.html` at
+`/` unless `--index` names another file (here a built seedshell's `browser/`, whose page
+is `shell.html`), and dials the relay at `127.0.0.1:8080` unless given `--relay`. It
+reads the certificate once, so restart it after a renewal; `sudo` is only for reading
+Let's Encrypt's private key. To the relay it is a proxy like any other: the authority carries
+the front's port, since it is not a default one, and the page's origin does too.
+
+To also take console nodes on plain `ws://`, and a page still under development on
+`localhost`, bind the relay publicly and name those as well, since `--allow-origin`
+replaces the localhost defaults:
+
+```sh
+seedrelay 8080 --host 0.0.0.0 --authority relay.example:8080 --authority relay.example:8443 \
+  --trusted-proxy 127.0.0.1 --allow-origin https://relay.example:8443 \
+  --allow-origin http://localhost:3000 --stun 3478
+```
+
 ### Private relays
 
 An open relay registers any key, so anyone who can reach it can splice two keys of
@@ -357,19 +393,31 @@ import { roomClient } from "seedrelay/rooms";
 const relay = "wss://relay.example";
 const { shell } = await bootShell({ /* … */ transport: { channels: combineChannels(new WsNetwork(), new RtcNetwork()) } });
 await shell.call("_net", new OpArgs("relay").text(relay).build());
+const mates = new Set();
 const rooms = roomClient({
   relay, publicKey, sign: (m) => sodium.crypto_sign_detached(m, privateKey),
   onMember: (room, key, present) => {
-    if (present) shell.call("_net", new OpArgs("addr").blob(fromHex(key)).blob(roomSecret).text(`relay+${relay}`).build());
+    if (present) mates.add(key); else mates.delete(key);
+    shell.call("_net", new OpArgs("welcome").blob(fromHex([...mates].join(""))).build());
+    if (present) shell.call("_net", new OpArgs("addr").blob(fromHex(key)).blob(new Uint8Array(32)).text(`relay+${relay}`).build());
   },
 });
 await rooms.join("my-room");
 ```
 
+A room has no secret: joining one is agreeing to be reached by everyone in it, and an
+app may be in several at once. The app tells the transport who its room-mates are with
+`welcome`, the whole set each time, and a call one of them places is answered whether or
+not this node has a contact secret. A room-mate is called with 32 zero bytes for a
+secret; an empty blob would make the transport present this node's own instead. A
+node's contact secret then gates only a caller it shares no room with, who needs it in
+its own `addr` for this node. An app in several rooms welcomes the keys of all of them.
+
 The transport redials a relay that drops, and its `relayState` operation reports
 whether it is registered; the room client redials its own socket and joins its rooms
-again. Linking is the app's too: a send dials, and the transport's `ready` operation
-dials every peer it has been given.
+again, and who was in them stays as last heard meanwhile. Linking is the app's too: a
+send dials, and the transport's `ready` operation dials every peer it has been given.
+Its `forget` operation drops one peer, for a room the app leaves.
 
 On a [private relay](#private-relays), pass the relay's secret to both. The transport's
 `relay` operation takes it as a second text after the URL, and `roomClient` takes it with
@@ -394,6 +442,7 @@ with `--relay-secret`.
 | `relay.mjs` | The relay: `createRelay({ authorities, limits, clock, … })`, `stunResponse`, and `parseOptions` for the command line. |
 | `rooms.mjs` | The room client apps use in the browser and on Node: `roomClient` and `roomId`. |
 | `server.mjs` | The `seedrelay` bin: parses the command line, listens (on UDP too, with `--stun`), and closes with `1012` on shutdown. The option list is also in its header comment. |
+| `scripts/https-front.mjs` | A TLS front for a server with a certificate and no proxy: serves a page over HTTPS and passes `/v1/` upgrades to the relay. See [Without a reverse proxy](#without-a-reverse-proxy). |
 | `test/relay.test.mjs` | Drives `createRelay` with fake sockets and a fake clock: registration and authorities, rooms and announcements, calls and splices, charging and caps, backpressure, frame validation, origins, proxy trust, options and log redaction; and one run of the bin over real sockets. |
 
 ## Troubleshooting
@@ -413,8 +462,8 @@ with `--relay-secret`.
   option.
 - **Other devices can't connect.** The relay binds `127.0.0.1` by default. Bind a
   reachable interface with `--host`, or better, put it behind a TLS proxy (see
-  [Deploying publicly](#deploying-publicly)). A page served over HTTPS also needs a
-  `wss://` relay URL.
+  [Deploying publicly](#deploying-publicly)), or behind `scripts/https-front.mjs` where
+  there is none. A page served over HTTPS also needs a `wss://` relay URL.
 - **Startup fails.** An option is malformed or unknown; the relay names it.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,
   exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff.

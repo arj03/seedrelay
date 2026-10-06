@@ -4,7 +4,7 @@
 // between them. The seedkernel channel handshake runs end to end through a splice, so
 // the relay forwards ciphertext it cannot read, and cannot pose as either end. It lives
 // in seedrelay because it is a deployment concern, not trusted runtime surface: the
-// kernel ships no server and its own tests use an in-process relay. Seedchat and
+// kernel ships no server and its own tests use an in-process relay. Seedshell and
 // seedstore both use it.
 //
 // Sockets, by upgrade path. The first segment names the wire version, and any other path

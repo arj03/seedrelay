@@ -811,7 +811,7 @@ test("real sockets: register, call and splice through a running relay", { timeou
   const [res] = await once(udp, "message");
   assert.deepEqual(mapped(res), ["127.0.0.1", udp.address().port], "the relay answers STUN");
 
-  // Two apps meet in a room through rooms.mjs, as seedchat and seedstore do.
+  // Two apps meet in a room through rooms.mjs, as seedshell and seedstore do.
   const heard = [];
   const client = (id) => {
     const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key),
