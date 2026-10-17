@@ -267,7 +267,10 @@ test("malformed or unknown options fail at startup instead of falling back", () 
   assert.deepEqual(o.authorities, ["relay.example"]);
   assert.throws(() => parseOptions(["--host", "0.0.0.0"]), /--authority/, "a wildcard bind has no name of its own");
   assert.equal(parseOptions(["--host", "::", "--authority", "relay.lan:8080"]).host, "::");
-  assert.deepEqual(parseOptions(["--stun", "3478"]).stun, { host: "127.0.0.1", port: 3478 }, "on --host unless named");
+  assert.deepEqual(parseOptions([]).stun, { host: "0.0.0.0", port: 3478 }, "on by default, on every interface");
+  assert.deepEqual(parseOptions(["--stun", "4000"]).stun, { host: "0.0.0.0", port: 4000 }, "on every interface unless named");
+  assert.equal(parseOptions(["--stun", "off"]).stun, null);
+  assert.equal(parseOptions([], { RELAY_STUN: "off" }).stun, null);
   assert.deepEqual(parseOptions(["--stun", "[::]:3478"]).stun, { host: "::", port: 3478 });
   assert.throws(() => parseOptions(["--stun", "0.0.0.0:stun"]), /--stun/);
   const bin = spawnSync(process.execPath, [SERVER, "--max-conns", "lots"], { encoding: "utf8", windowsHide: true });
@@ -749,7 +752,9 @@ test("a registration split across the upgrade head and later reads is accepted",
  *  and the port it listens on. */
 async function startRelay(t, args = [], env = {}, ...more) {
   const clean = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
-  const child = spawn(process.execPath, [SERVER, "0", ...args],
+  // STUN off unless asked for, so relays started one after another never race for 3478.
+  const stun = args.includes("--stun") ? [] : ["--stun", "off"];
+  const child = spawn(process.execPath, [SERVER, "0", ...stun, ...args],
     { env: { ...clean, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   t.after(() => child.kill());
   const output = await new Promise((resolve, reject) => {

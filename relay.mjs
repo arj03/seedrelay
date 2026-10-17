@@ -88,7 +88,7 @@ const LIMIT_FLAGS = {
  *  with a limit it was not given is worse than one that does not start. */
 export function parseOptions(argv, env = {}) {
   const options = { port: 8080, host: "127.0.0.1", authorities: [], allowOrigins: [], trustedProxies: [], secrets: [],
-    limits: {}, stun: null };
+    limits: {}, stun: { host: "0.0.0.0", port: 3478 } };
   const number = (flag, value, max) => {
     const n = Number(value);
     if (value === undefined || value === "" || !Number.isFinite(n) || n < 0 || n > max ||
@@ -104,10 +104,13 @@ export function parseOptions(argv, env = {}) {
   for (const a of list(env.RELAY_AUTHORITIES)) options.authorities.push(authorityOption(a));
   for (const ip of list(env.RELAY_TRUSTED_PROXIES)) options.trustedProxies.push(proxyOption(ip));
   for (const secret of list(env.RELAY_SECRETS)) options.secrets.push(secretOption(secret));
+  // On every interface unless a host is named: UDP cannot reach a relay through the HTTP
+  // proxy it may sit behind on loopback.
   const stun = (flag, value) => {
+    if (value === "off") return null;
     const m = /^(?:\[?([^\]\s]+?)\]?:)?(\d+)$/.exec(value);
-    if (!m) throw new Error(`${flag} takes [host:]port, not ${JSON.stringify(value)}`);
-    return { host: m[1] ?? null, port: number(flag, m[2], 65535) };
+    if (!m) throw new Error(`${flag} takes [host:]port or off, not ${JSON.stringify(value)}`);
+    return { host: m[1] ?? "0.0.0.0", port: number(flag, m[2], 65534) };
   };
   if (env.RELAY_STUN !== undefined) options.stun = stun("RELAY_STUN", env.RELAY_STUN);
 
@@ -131,7 +134,6 @@ export function parseOptions(argv, env = {}) {
   if (options.authorities.length === 0 && (options.host === "0.0.0.0" || options.host === "::")) {
     throw new Error(`a relay bound to ${options.host} needs --authority: the host[:port] nodes dial it by`);
   }
-  if (options.stun && options.stun.host === null) options.stun.host = options.host;
   return options;
 }
 

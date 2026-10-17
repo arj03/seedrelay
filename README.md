@@ -97,7 +97,7 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
 | `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters, with no commas or whitespace at either end. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
-| `--stun [HOST:]PORT` | `RELAY_STUN` | off | Answer STUN Binding requests on this UDP port, on `--host` unless a host is named. Nodes ask a relay's port `3478`; see [STUN](#stun). |
+| `--stun [HOST:]PORT`, `--stun off` | `RELAY_STUN` | `3478` | Answer STUN Binding requests on this UDP port and the next, on every interface unless a host is named, since UDP does not pass through an HTTP proxy; `off` answers none. Nodes ask a relay's ports `3478` and `3479`; see [STUN](#stun). |
 
 A malformed value or an unknown option stops the relay at startup, rather than leaving it
 running with a limit it was not given.
@@ -267,11 +267,14 @@ nodes behind NAT should raise `--max-conns` with the process's file limit.
 
 WebRTC connects two nodes behind NAT only once each knows the address the internet sees
 it at, which it learns from a STUN server. The seedkernel transport asks the relay a
-peer is linked through, at `stun:<relay host>:3478`: the relay already sees that
-address, so no third party learns who is online. `--stun` answers those requests on UDP
-(RFC 8489 Binding only, at most 20 a second to one address, and at most 256 new
-addresses a second, since UDP sources can be forged). Without it, pairs on
-different networks mostly stay relayed.
+peer is linked through, at `stun:<relay host>:3478` and `:3479`: the relay already sees
+that address, so no third party learns who is online. The relay answers those requests on
+UDP 3478 and 3479 unless `--stun` says otherwise (RFC 8489 Binding only, at most 20 a
+second to one address, and at most 256 new addresses a second, since UDP sources can be
+forged).
+Two ports, because a node whose two answers name different ports is behind a NAT that
+gives each destination its own port, and its UDP path then takes more than a plain punch.
+With `--stun off`, pairs on different networks mostly stay relayed.
 
 ## Deploying publicly
 
@@ -304,11 +307,11 @@ end either way; over `ws://` an observer sees the room ids a node joins, the roo
 keys and who calls whom, so a console node that needs a private room should reach its
 peers by key, joining no room, instead.
 
-**Answer STUN on the public address.** UDP does not pass through an HTTP proxy, so bind
-STUN to a public interface, and open UDP 3478:
+**Open UDP 3478 and 3479.** UDP does not pass through an HTTP proxy, so the relay answers
+STUN on every interface even when it is bound to loopback behind one:
 
 ```sh
-seedrelay 8080 --authority relay.example --trusted-proxy 127.0.0.1 --stun 0.0.0.0:3478
+seedrelay 8080 --authority relay.example --trusted-proxy 127.0.0.1
 ```
 
 Connection accounting starts at the TCP level, before HTTP headers arrive. Direct
@@ -329,11 +332,11 @@ sudo node scripts/https-front.mjs --cert /etc/letsencrypt/live/relay.example/ful
   --root ../seedshell/browser --index shell.html
 
 seedrelay 8080 --authority relay.example:8443 --trusted-proxy 127.0.0.1 \
-  --allow-origin https://relay.example:8443 --stun 0.0.0.0:3478
+  --allow-origin https://relay.example:8443
 ```
 
 Then `https://relay.example:8443/` is the page and `wss://relay.example:8443` the relay,
-which is where a seedshell page served over HTTPS looks for it. Open TCP 8443 and UDP 3478.
+which is where a seedshell page served over HTTPS looks for it. Open TCP 8443 and UDP 3478 and 3479.
 
 The front listens on `8443` unless given `--port`, serves `--root` with `index.html` at
 `/` unless `--index` names another file (here a built seedshell's `browser/`, whose page
@@ -349,7 +352,7 @@ replaces the localhost defaults:
 ```sh
 seedrelay 8080 --host 0.0.0.0 --authority relay.example:8080 --authority relay.example:8443 \
   --trusted-proxy 127.0.0.1 --allow-origin https://relay.example:8443 \
-  --allow-origin http://localhost:3000 --stun 3478
+  --allow-origin http://localhost:3000
 ```
 
 ### Private relays
@@ -441,7 +444,7 @@ with `--relay-secret`.
 | --- | --- |
 | `relay.mjs` | The relay: `createRelay({ authorities, limits, clock, … })`, `stunResponse`, and `parseOptions` for the command line. |
 | `rooms.mjs` | The room client apps use in the browser and on Node: `roomClient` and `roomId`. |
-| `server.mjs` | The `seedrelay` bin: parses the command line, listens (on UDP too, with `--stun`), and closes with `1012` on shutdown. The option list is also in its header comment. |
+| `server.mjs` | The `seedrelay` bin: parses the command line, listens (on UDP too, for STUN), and closes with `1012` on shutdown. The option list is also in its header comment. |
 | `scripts/https-front.mjs` | A TLS front for a server with a certificate and no proxy: serves a page over HTTPS and passes `/v1/` upgrades to the relay. See [Without a reverse proxy](#without-a-reverse-proxy). |
 | `test/relay.test.mjs` | Drives `createRelay` with fake sockets and a fake clock: registration and authorities, rooms and announcements, calls and splices, charging and caps, backpressure, frame validation, origins, proxy trust, options and log redaction; and one run of the bin over real sockets. |
 
@@ -474,7 +477,7 @@ with `--relay-secret`.
   proxy rewrites `Host` to another of the relay's names. Forward the original `Host`.
 - **A call comes back unreachable.** The callee is not registered on this relay, or the
   caller's address already has a room's worth of calls waiting, or 8 splices to that key.
-- **Peers on different networks stay relayed.** The relay answers no STUN, so browsers
-  cannot learn their public addresses. Start it with `--stun` and open UDP 3478.
+- **Peers on different networks stay relayed.** Nodes cannot reach the relay's STUN, so they
+  cannot learn their public addresses. Open UDP 3478 and 3479, and drop any `--stun off`.
 - **Relayed traffic is slow.** The sending address is past `--splice-rate`; raise it,
   or `0` to leave splices unmetered.

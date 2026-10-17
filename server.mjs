@@ -23,7 +23,8 @@
 //   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
 //   --secret SECRET        register only nodes and apps given this secret, 16+ characters,
 //                          no commas (repeatable; env RELAY_SECRETS, which keeps it out of `ps`)
-//   --stun [HOST:]PORT     answer STUN on this UDP port, on --host unless named (env RELAY_STUN)
+//   --stun [HOST:]PORT|off answer STUN on this UDP port and the next, on every interface
+//                          unless a host is named (default 3478; env RELAY_STUN)
 
 import { createSocket } from "node:dgram";
 import { createRelay, localAuthorities, parseOptions } from "./relay.mjs";
@@ -40,17 +41,22 @@ const relay = createRelay(options);
 const { host } = options;
 const bracket = (h) => (h.includes(":") ? `[${h}]` : h);
 
-let udp = null;
+// Two ports, so a node can tell a NAT that gives each destination its own port: the two
+// answers then name different ones. Port 0 asks the OS for two.
+const udp = [];
 if (options.stun) {
-  udp = createSocket(options.stun.host.includes(":") ? "udp6" : "udp4");
-  udp.on("message", (msg, from) => {
-    const answer = relay.stun(msg, from.address, from.port);
-    if (answer) udp.send(answer, from.port, from.address);
-  });
-  udp.on("error", (e) => { console.error(`seedrelay: STUN: ${e.message}`); process.exit(1); });
-  udp.bind(options.stun.port, options.stun.host, () => {
-    console.log(`  STUN on udp://${bracket(options.stun.host)}:${udp.address().port}`);
-  });
+  for (const port of options.stun.port === 0 ? [0, 0] : [options.stun.port, options.stun.port + 1]) {
+    const socket = createSocket(options.stun.host.includes(":") ? "udp6" : "udp4");
+    socket.on("message", (msg, from) => {
+      const answer = relay.stun(msg, from.address, from.port);
+      if (answer) socket.send(answer, from.port, from.address);
+    });
+    socket.on("error", (e) => { console.error(`seedrelay: STUN: ${e.message}`); process.exit(1); });
+    socket.bind(port, options.stun.host, () => {
+      console.log(`  STUN on udp://${bracket(options.stun.host)}:${socket.address().port}`);
+    });
+    udp.push(socket);
+  }
 }
 relay.server.listen(options.port, host, () => {
   const port = relay.server.address().port;
@@ -73,7 +79,7 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, () => {
     relay.close();
     relay.server.close();
-    udp?.close();
+    for (const socket of udp) socket.close();
     // Sockets whose far ends never close hold the process no longer than this.
     setTimeout(() => process.exit(0), 2000).unref();
   });
