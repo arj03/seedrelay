@@ -99,12 +99,15 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters, with no commas or whitespace at either end. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
 | `--stun [HOST:]PORT`, `--stun off` | `RELAY_STUN` | `3478` | Answer STUN Binding requests on this UDP port and the next, on every interface unless a host is named, since UDP does not pass through an HTTP proxy; `off` answers none. Nodes ask a relay's ports `3478` and `3479`; see [STUN](#stun). |
 
-A malformed value or an unknown option stops the relay at startup, rather than leaving it
-running with a limit it was not given.
+A malformed value (including a whitespace-only number) or an unknown option stops the
+relay at startup, rather than leaving it running with a limit it was not given. An
+explicitly set `RELAY_SECRETS` must name at least one secret, or a `--secret` flag must
+supply one; leave it unset for an open relay.
 
 Without `--authority`, a relay bound to a loopback address answers to `localhost`,
 `127.0.0.1` and `[::1]` at its port, and one bound to any other address to that
-address. A relay bound to `0.0.0.0` or `::` has no name of its own and will not start
+address. A relay bound to every interface — `0.0.0.0`, `::`, any other spelling of the
+unspecified address, or an empty `--host` — has no name of its own and will not start
 without `--authority`, and neither does a relay nodes reach by any other name, such as a
 public one behind a proxy.
 
@@ -174,7 +177,8 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`,
 - **Splices.** Data frames are streamed through unmasked, whatever their size or
   fragmentation, so the relay holds a chunk, never a whole message. Ping and pong stay on
   each hop, and a close ends both ends. A full receiver, or a sender past its
-  address's budget, pauses the sender.
+  address's budget, pauses the sender, and a receiver that does not drain for 2 minutes
+  ends the splice.
 
 Rooms are not authenticated: **a room id is a bearer credential** for learning which
 keys are in it, and a name is only as private as it is hard to guess. For a private
@@ -322,14 +326,15 @@ once its headers arrive. Apply connection and request limits at the proxy as wel
 ### Without a reverse proxy
 
 A server that has a certificate and no proxy can run `scripts/https-front.mjs` in a
-proxy's place: one Node process, with no dependencies, that serves a page's files over
-HTTPS and passes WebSocket upgrades under `/v1/` to the relay. It takes any port, so it
-fits beside whatever already holds 80 and 443:
+proxy's place: one Node process, with no third-party dependencies, that serves a page's
+files over HTTPS and passes WebSocket upgrades under `/v1/` to the relay. It takes any
+port, so it fits beside whatever already holds 80 and 443:
 
 ```sh
 sudo node scripts/https-front.mjs --cert /etc/letsencrypt/live/relay.example/fullchain.pem \
   --key /etc/letsencrypt/live/relay.example/privkey.pem \
-  --root ../seedshell/browser --index shell.html
+  --root ../seedshell/browser --index shell.html \
+  --user www-data
 
 seedrelay 8080 --authority relay.example:8443 --trusted-proxy 127.0.0.1 \
   --allow-origin https://relay.example:8443
@@ -341,9 +346,13 @@ which is where a seedshell page served over HTTPS looks for it. Open TCP 8443 an
 The front listens on `8443` unless given `--port`, serves `--root` with `index.html` at
 `/` unless `--index` names another file (here a built seedshell's `browser/`, whose page
 is `shell.html`), and dials the relay at `127.0.0.1:8080` unless given `--relay`. It
-reads the certificate once, so restart it after a renewal; `sudo` is only for reading
-Let's Encrypt's private key. To the relay it is a proxy like any other: the authority carries
-the front's port, since it is not a default one, and the page's origin does too.
+reads the certificate once, so restart it after a renewal. Root is only for the key and
+the port: it reads one and binds the other, then runs as `--user` (and `--group`, default
+the same), so `--root` must be readable by that user. Started as root without `--user`, it
+refuses. It holds at most 256 sockets and gives a client 10 seconds for its headers and 60
+for its request, since the relay sees a client only once its headers are in. To the relay
+it is a proxy like any other: the authority carries the front's port, since it is not a
+default one, and the page's origin does too.
 
 To also take console nodes on plain `ws://`, and a page still under development on
 `localhost`, bind the relay publicly and name those as well, since `--allow-origin`
@@ -468,8 +477,11 @@ with `--relay-secret`.
   [Deploying publicly](#deploying-publicly)), or behind `scripts/https-front.mjs` where
   there is none. A page served over HTTPS also needs a `wss://` relay URL.
 - **Startup fails.** An option is malformed or unknown; the relay names it.
+- **The HTTPS front refuses to start as root.** Pass `--user`. If pages 404 after it
+  starts, `--root` is not readable by that user.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,
-  exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff.
+  exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff. A splice
+  also ends when its far end does not drain for 2 minutes.
 - **A node or app never registers, and the relay logs `! dropped: no secret`.** The
   relay was started with `--secret`, and the client has none or another one.
 - **A node never registers.** The relay logs `! dropped: bad registration`: the node

@@ -39,7 +39,7 @@ try {
 
 const relay = createRelay(options);
 const { host } = options;
-const bracket = (h) => (h.includes(":") ? `[${h}]` : h);
+const bracket = (h) => (h.includes(":") && !h.startsWith("[") ? `[${h}]` : h);
 
 // Two ports, so a node can tell a NAT that gives each destination its own port: the two
 // answers then name different ones. Port 0 asks the OS for two.
@@ -47,12 +47,21 @@ const udp = [];
 if (options.stun) {
   for (const port of options.stun.port === 0 ? [0, 0] : [options.stun.port, options.stun.port + 1]) {
     const socket = createSocket(options.stun.host.includes(":") ? "udp6" : "udp4");
+    let listening = false;
     socket.on("message", (msg, from) => {
       const answer = relay.stun(msg, from.address, from.port);
-      if (answer) socket.send(answer, from.port, from.address);
+      // With a callback, a reply that cannot be sent (to a forged source, say) is dropped
+      // instead of becoming an 'error' on the socket.
+      if (answer) socket.send(answer, from.port, from.address, () => {});
     });
-    socket.on("error", (e) => { console.error(`seedrelay: STUN: ${e.message}`); process.exit(1); });
+    socket.on("error", (e) => {
+      // Before bind this is a startup failure; afterwards a send or interface error only
+      // costs STUN, not the relay's WebSocket service.
+      if (!listening) { console.error(`seedrelay: STUN: ${e.message}`); process.exit(1); }
+      console.error(`seedrelay: STUN: ${e.message} (continuing)`);
+    });
     socket.bind(port, options.stun.host, () => {
+      listening = true;
       console.log(`  STUN on udp://${bracket(options.stun.host)}:${socket.address().port}`);
     });
     udp.push(socket);
@@ -70,7 +79,7 @@ relay.server.listen(options.port, host, () => {
     `IPv6 by /${l.ipv6Prefix}, registrations ${l.registerRate > 0 ? `${l.registerRate}/s per ip` : "unmetered"}, ` +
     `splices ${l.spliceRate > 0 ? `${l.spliceRate} KiB/s per ip` : "unmetered"}${relay.proxies.size ? " (X-Forwarded-For trusted)" : ""}`);
   console.log(`  heartbeat: ${l.heartbeatSecs > 0 ? `${l.heartbeatSecs}s ping/reap` : "disabled"}`);
-  if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1" && host !== "[::1]") {
     console.log(`  ⚠  bound to ${host}: exposed to the network`);
   }
 });

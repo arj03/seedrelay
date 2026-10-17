@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // A TLS front for a relay and a page, for a server with a certificate and no proxy: it
 // serves the files under --root over HTTPS and passes WebSocket upgrades under /v1/ to the
-// relay, so https://NAME:PORT/ is the page and wss://NAME:PORT the relay. No dependencies.
+// relay, so https://NAME:PORT/ is the page and wss://NAME:PORT the relay. No third-party
+// dependencies.
 //
 // Run: node scripts/https-front.mjs --cert FILE --key FILE --root DIR [options]
 //   --cert FILE        the certificate chain, PEM (Let's Encrypt's fullchain.pem)
@@ -11,12 +12,15 @@
 //   --host HOST        interface to bind (default every one)
 //   --index FILE       the file served for / (default index.html)
 //   --relay HOST:PORT  where the relay listens (default 127.0.0.1:8080)
+//   --user USER        the user to run as once bound; required when started as root
+//   --group GROUP      the group to run as (default USER)
 //
 // The relay sees this front as its client, so it needs --trusted-proxy with the address
 // this front dials it from (127.0.0.1) to read the visitor's own from X-Forwarded-For,
 // --authority NAME:PORT, and --allow-origin https://NAME:PORT for the page.
 //
-// The certificate is read once: restart the front after it renews.
+// The certificate is read once: restart the front after it renews. It is read, and the
+// port bound, before the front drops to --user, so --root must be readable by that user.
 
 import { createServer } from "node:https";
 import { connect } from "node:net";
@@ -28,7 +32,8 @@ function fail(message) {
   process.exit(2);
 }
 
-const options = { cert: null, key: null, root: null, port: "8443", host: null, index: "index.html", relay: "127.0.0.1:8080" };
+const options = { cert: null, key: null, root: null, port: "8443", host: null, index: "index.html", relay: "127.0.0.1:8080",
+  user: null, group: null };
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i += 2) {
   const name = argv[i].startsWith("--") ? argv[i].slice(2) : "";
@@ -37,6 +42,8 @@ for (let i = 0; i < argv.length; i += 2) {
   options[name] = argv[i + 1];
 }
 for (const name of ["cert", "key", "root"]) if (!options[name]) fail(`--${name} is required`);
+// Serving the internet as root would give every request root's file access.
+if (process.getuid?.() === 0 && !options.user) fail("refusing to run as root; pass --user USER");
 
 const port = Number(options.port);
 if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`--port takes a port, not ${JSON.stringify(options.port)}`);
@@ -67,12 +74,31 @@ const TYPES = {
 
 // How long a socket this front ended is given to close before it is destroyed.
 const END_WAIT_MS = 10_000;
+// Sockets at once, and how long a client may take over its headers and its request, so
+// clients that never finish cannot hold the front's sockets: the relay only sees them once
+// their headers are in.
+const MAX_CONNS = 256;
+const HEADERS_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 
 /** End a socket so what is queued for it still goes out, and give up on its far end
  *  after END_WAIT_MS. */
 function endSoon(sock) {
   sock.end();
   setTimeout(() => sock.destroy(), END_WAIT_MS).unref();
+}
+
+/** Run as --user from here on, once the key is read and the port bound. */
+function dropPrivileges() {
+  if (!options.user) return;
+  const group = options.group ?? options.user;
+  try {
+    process.initgroups(options.user, group);
+    process.setgid(group);
+    process.setuid(options.user);
+  } catch (e) {
+    fail(`could not run as ${options.user}:${group}: ${e.message}`);
+  }
 }
 
 const server = createServer(tls, (req, res) => {
@@ -95,6 +121,10 @@ const server = createServer(tls, (req, res) => {
   if (req.method === "HEAD") { res.end(); return; }
   createReadStream(file).on("error", () => res.destroy()).pipe(res);
 });
+
+server.maxConnections = MAX_CONNS;
+server.headersTimeout = HEADERS_TIMEOUT_MS;
+server.requestTimeout = REQUEST_TIMEOUT_MS;
 
 // The upgrade request goes to the relay as it came, Host included, since that is the name
 // registrations are signed for. The relay answers it, refusals too.
@@ -119,8 +149,15 @@ server.on("upgrade", (req, sock, head) => {
   sock.on("close", () => endSoon(up));
 });
 
-server.on("error", (e) => { console.error(`https-front: ${e.message}`); process.exit(1); });
+let listening = false;
+server.on("error", (e) => {
+  // Failing to listen (a taken port, say) is fatal; an error once serving is not.
+  console.error(`https-front: ${e.message}`);
+  if (!listening) process.exit(1);
+});
 server.listen(port, options.host ?? undefined, () => {
+  listening = true;
+  dropPrivileges();
   const at = server.address();
   console.log(`https-front listening on https://${at.address.includes(":") ? `[${at.address}]` : at.address}:${at.port}/`);
   console.log(`  serving ${root}, with ${options.index} at /`);

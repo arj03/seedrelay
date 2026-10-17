@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { request } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { createSocket } from "node:dgram";
-import { createRelay, localAuthorities, parseOptions, stunResponse } from "../relay.mjs";
+import { createRelay, localAuthorities, parseOptions, SPLICE_HOLD_MS, stunResponse } from "../relay.mjs";
 import { roomClient } from "../rooms.mjs";
 
 const SERVER = fileURLToPath(new URL("../server.mjs", import.meta.url));
@@ -266,7 +266,23 @@ test("malformed or unknown options fail at startup instead of falling back", () 
   assert.equal(o.limits.maxConns, 10);
   assert.deepEqual(o.authorities, ["relay.example"]);
   assert.throws(() => parseOptions(["--host", "0.0.0.0"]), /--authority/, "a wildcard bind has no name of its own");
+  for (const h of ["", "::0", "[::]", "0:0:0:0:0:0:0:0", "0000::"]) {
+    assert.throws(() => parseOptions(["--host", h]), /--authority/, `wildcard ${JSON.stringify(h)}`);
+  }
+  assert.equal(parseOptions(["--host", "", "--authority", "relay.lan:8080"]).host, "");
+  assert.deepEqual(localAuthorities("[::1]", 8080), ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"]);
   assert.equal(parseOptions(["--host", "::", "--authority", "relay.lan:8080"]).host, "::");
+  for (const args of [["--register-rate", " "], ["--splice-rate", " "], ["--heartbeat-secs", " "], ["--port", " "]]) {
+    assert.throws(() => parseOptions(args), Error, `whitespace ${args.join(" ")}`);
+  }
+  for (const env of [{ RELAY_REGISTER_RATE: " " }, { RELAY_SPLICE_RATE: " " }, { RELAY_HEARTBEAT_SECS: " " }]) {
+    assert.throws(() => parseOptions([], env), /RELAY_/);
+  }
+  for (const value of ["", "   ", ",,,"]) {
+    assert.throws(() => parseOptions([], { RELAY_SECRETS: value }), /RELAY_SECRETS/);
+  }
+  assert.deepEqual(parseOptions(["--secret", "correct horse battery"], { RELAY_SECRETS: "" }).secrets,
+    ["correct horse battery"], "a --secret flag can supply what an empty variable did not");
   assert.deepEqual(parseOptions([]).stun, { host: "0.0.0.0", port: 3478 }, "on by default, on every interface");
   assert.deepEqual(parseOptions(["--stun", "4000"]).stun, { host: "0.0.0.0", port: 4000 }, "on every interface unless named");
   assert.equal(parseOptions(["--stun", "off"]).stun, null);
@@ -508,6 +524,10 @@ test("STUN: a Binding request learns the address it came from, and nothing else 
     Buffer.from(request).fill(0x11, 1, 2), Buffer.from(request).fill(0, 4, 5)]) {
     assert.equal(stunResponse(bad, "192.0.2.1", 1), null, bad.toString("hex"));
   }
+  // A UDP source port is 1..65535; a raw packet with port 0 must not reach a sender that
+  // would throw on it.
+  assert.equal(stunResponse(request, "192.0.2.1", 0), null, "source port 0");
+  assert.equal(stunResponse(request, "192.0.2.1", 65536), null, "source port out of range");
   const f = fixture();
   assert.deepEqual(mapped(f.relay.stun(binding(), "::ffff:192.0.2.9", 7)), ["192.0.2.9", 7], "a mapped address is IPv4");
   let answered = 0;
@@ -558,6 +578,39 @@ test("a far end that cannot keep up pauses only the splice it is on", () => {
   assert.equal(serverFrames(ca).at(-1).payload.toString(), "to c");
   ba.drain();
   assert.equal(ab.paused, false, "read again once the far end drains");
+});
+
+test("a sender paused by a full receiver survives the heartbeat, then gives up", () => {
+  const f = fixture(), a = f.member(), b = f.member();
+  const [sa, sb] = f.splice(a, b);
+  sb.full = true;
+  sa.emit("data", frame(2, Buffer.alloc(16 * 1024)));
+  assert.equal(sa.paused, true, "the sender is paused, not gone");
+  f.beat();
+  sb.emit("data", frame(10));
+  f.beat();
+  sb.emit("data", frame(10));
+  assert.equal(sa.destroyed, false, "a paused sender cannot answer a ping, so it is not reaped");
+  f.advance(SPLICE_HOLD_MS);
+  assert.equal(sa.destroyed, true, "a receiver that never drains ends the splice");
+  assert.equal(sb.destroyed, true);
+});
+
+test("a sender paused by its splice-rate debt is not reaped by the heartbeat", () => {
+  const f = fixture(["--splice-rate", "0.1"]), a = f.member(), b = f.member();
+  const [sa, sb] = f.splice(a, b);
+  sa.emit("data", frame(2, Buffer.alloc(16 * 1024)));
+  assert.equal(sa.paused, true);
+  f.advance(30_000);
+  f.beat();
+  sb.emit("data", frame(10));
+  f.advance(30_000);
+  f.beat();
+  sb.emit("data", frame(10));
+  assert.equal(sa.destroyed, false, "the debt is not silence");
+  f.advance(200_000);
+  assert.equal(sa.paused, false, "the meter resumes it once the debt is paid");
+  assert.equal(sa.destroyed, false);
 });
 
 test("invalid control sizes, RSV, fragmentation, masking and lengths are rejected", () => {

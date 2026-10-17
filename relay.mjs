@@ -91,7 +91,7 @@ export function parseOptions(argv, env = {}) {
     limits: {}, stun: { host: "0.0.0.0", port: 3478 } };
   const number = (flag, value, max) => {
     const n = Number(value);
-    if (value === undefined || value === "" || !Number.isFinite(n) || n < 0 || n > max ||
+    if (typeof value !== "string" || value.trim() === "" || !Number.isFinite(n) || n < 0 || n > max ||
         (max !== Infinity && !Number.isInteger(n))) {
       throw new Error(`${flag} takes ${max === Infinity ? "a non-negative number" : `an integer from 0 to ${max}`}, not ${JSON.stringify(value ?? "")}`);
     }
@@ -131,8 +131,14 @@ export function parseOptions(argv, env = {}) {
     else if (/^\d+$/.test(a)) options.port = number("the port", a, 65535);
     else throw new Error(`unknown option ${a}`);
   }
-  if (options.authorities.length === 0 && (options.host === "0.0.0.0" || options.host === "::")) {
-    throw new Error(`a relay bound to ${options.host} needs --authority: the host[:port] nodes dial it by`);
+  if (env.RELAY_SECRETS !== undefined && options.secrets.length === 0) {
+    // An explicitly set variable with no secret is a half-configured private relay,
+    // unless a --secret flag supplied one.
+    throw new Error("RELAY_SECRETS is set but names no secret; unset it for an open relay");
+  }
+  if (options.authorities.length === 0 && isWildcardHost(options.host)) {
+    const bound = options.host === "" ? "every interface" : options.host;
+    throw new Error(`a relay bound to ${bound} needs --authority: the host[:port] nodes dial it by`);
   }
   return options;
 }
@@ -163,12 +169,26 @@ function proxyOption(value) {
   return ip;
 }
 
+/** Whether binding `host` listens on every interface. Node treats an empty host and every
+ *  spelling of an unspecified address as a wildcard, so the --authority guard must too. */
+function isWildcardHost(host) {
+  if (host === "") return true;
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const ip = normalizeIp(bare);
+  return ip === "0.0.0.0" || ip === "::";
+}
+
 /** The names a relay bound to `host` answers to when none are given: the loopback names
  *  on a loopback address, else the address itself. A relay nodes reach under any other
  *  name (a public one, behind a proxy), or bound to every interface, needs `--authority`. */
 export function localAuthorities(host, port) {
-  const at = (h) => canonicalAuthority(`${h.includes(":") ? `[${h}]` : h}:${port}`);
-  if (host === "localhost" || host === "::1" || /^127\./.test(host)) return ["localhost", "127.0.0.1", "::1"].map(at);
+  const at = (h) => {
+    const bare = h.startsWith("[") && h.endsWith("]") ? h.slice(1, -1) : h;
+    return canonicalAuthority(`${bare.includes(":") ? `[${bare}]` : bare}:${port}`);
+  };
+  if (host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host)) {
+    return ["localhost", "127.0.0.1", "::1"].map(at);
+  }
   return [at(host)];
 }
 
@@ -198,6 +218,9 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 // How long a call waits for both of its splice sockets, and how long a socket the relay
 // ended is given to close before it is destroyed.
 const SPLICE_WAIT_MS = 10_000;
+// How long a sender may stay paused on a far end that does not drain. A paused socket is
+// not pinged, since it cannot read the pong, so this is what reaps a dead receiver.
+export const SPLICE_HOLD_MS = 2 * 60_000;
 // Splice sockets may take this share of --max-conns and no more, so a relay busy with
 // splices still has room for nodes to register.
 const SPLICE_SHARE = 7 / 8;
@@ -354,6 +377,7 @@ const STUN_COOKIE = 0x2112a442, STUN_RATE = 20, STUN_NEW_RATE = 256;
 /** The Binding success response to a STUN Binding request from `ip`:`port`, carrying its
  *  XOR-MAPPED-ADDRESS; null for anything else. */
 export function stunResponse(msg, ip, port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   if (msg.length < 20 || msg.length % 4 !== 0 || msg.readUInt16BE(0) !== 0x0001 ||
       msg.readUInt16BE(2) !== msg.length - 20 || msg.readUInt32BE(4) !== STUN_COOKIE) return null;
   const v6 = ip.includes(":");
@@ -858,6 +882,7 @@ class SpliceEnd {
     this.holds = 1;            // paused until joined
     this.waiting = false;      // held until the far end drains
     this.metered = false;      // held until its address's budget recovers
+    this.holdTimer = null;     // gives up on a far end that does not drain
     this.early = head?.length ? Buffer.from(head) : null; // what came with the upgrade
     this.reader = new FrameReader(this, SPLICE_FRAMES);
     sock.pause();
@@ -876,7 +901,14 @@ class SpliceEnd {
   }
 
   hold() { if (this.holds++ === 0) this.sock.pause(); }
-  release() { if (--this.holds === 0) this.sock.resume(); }
+  release() {
+    if (--this.holds === 0) {
+      // A socket is not dead because the relay stopped reading it; give it a full
+      // heartbeat interval to answer before reaping it.
+      this.alive = true;
+      this.sock.resume();
+    }
+  }
 
   take(chunk) {
     this.alive = true;
@@ -884,14 +916,20 @@ class SpliceEnd {
     this.relay.meter(this, chunk.length);
   }
 
-  /** Write to the far end; a far end that cannot take more holds this one until it drains. */
+  /** Write to the far end; a far end that cannot take more holds this one until it drains,
+   *  or gives up on both after SPLICE_HOLD_MS of not draining at all. */
   forward(bytes) {
     const dst = this.far.sock;
     if (dst.destroyed || !dst.writable) return;
     if (!dst.write(bytes) && !this.waiting) {
       this.waiting = true;
       this.hold();
-      dst.once("drain", () => { this.waiting = false; this.release(); });
+      this.holdTimer = later(this.relay.clock, () => { this.sock.destroy(); dst.destroy(); }, SPLICE_HOLD_MS);
+      dst.once("drain", () => {
+        this.relay.clock.clearTimeout(this.holdTimer);
+        this.waiting = false;
+        this.release();
+      });
     }
   }
 
@@ -916,9 +954,10 @@ class SpliceEnd {
     }
   }
 
-  /** Pinged only while joined and between the frames forwarded to it. */
+  /** Pinged only while joined, between frames, and not paused: a paused socket cannot read
+   *  the pong, so reaping it as silent would cut a healthy transfer. */
   beat() {
-    if (!this.linked || this.mid) return;
+    if (!this.linked || this.mid || this.holds > 0) return;
     if (!this.alive) { this.sock.destroy(); return; }
     this.alive = false;
     writeFrame(this.sock, PING);
@@ -930,6 +969,7 @@ class SpliceEnd {
   }
 
   onClose() {
+    this.relay.clock.clearTimeout(this.holdTimer);
     this.relay.spliceSockets--;
     this.linked = false;
     if (this.far?.linked) {
