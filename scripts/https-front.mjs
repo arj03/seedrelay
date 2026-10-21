@@ -13,7 +13,7 @@
 //   --index FILE       the file served for / (default index.html)
 //   --relay HOST:PORT  where the relay listens (default 127.0.0.1:8080)
 //   --user USER        the user to run as once bound; required when started as root
-//   --group GROUP      the group to run as (default USER)
+//   --group GROUP      the group to run as (default USER's primary group)
 //
 // The relay sees this front as its client, so it needs --trusted-proxy with the address
 // this front dials it from (127.0.0.1) to read the visitor's own from X-Forwarded-For,
@@ -22,10 +22,14 @@
 // The certificate is read once: restart the front after it renews. It is read, and the
 // port bound, before the front drops to --user, so --root must be readable by that user.
 
+import { execFileSync } from "node:child_process";
 import { createServer } from "node:https";
 import { connect } from "node:net";
-import { createReadStream, readFileSync, statSync } from "node:fs";
+import { userInfo } from "node:os";
+import { readFileSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
+import { pipeline } from "node:stream";
 
 function fail(message) {
   console.error(`https-front: ${message}`);
@@ -42,8 +46,7 @@ for (let i = 0; i < argv.length; i += 2) {
   options[name] = argv[i + 1];
 }
 for (const name of ["cert", "key", "root"]) if (!options[name]) fail(`--${name} is required`);
-// Serving the internet as root would give every request root's file access.
-if (process.getuid?.() === 0 && !options.user) fail("refusing to run as root; pass --user USER");
+const runAs = identity();
 
 const port = Number(options.port);
 if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`--port takes a port, not ${JSON.stringify(options.port)}`);
@@ -84,24 +87,47 @@ const REQUEST_TIMEOUT_MS = 60_000;
 /** End a socket so what is queued for it still goes out, and give up on its far end
  *  after END_WAIT_MS. */
 function endSoon(sock) {
+  if (sock.destroyed) return;
   sock.end();
-  setTimeout(() => sock.destroy(), END_WAIT_MS).unref();
+  const t = setTimeout(() => sock.destroy(), END_WAIT_MS).unref();
+  sock.once("close", () => clearTimeout(t));
+}
+
+/** The user and group to drop to once bound, or null to stay as started. Only root can
+ *  switch, so anyone else may name only the user it already is, and no group. Checked
+ *  before binding, so a mistake fails at once rather than after the port is taken. */
+function identity() {
+  // Serving the internet as root would give every request root's file access.
+  if (process.getuid?.() !== 0) {
+    const self = userInfo().username;
+    if (options.user !== null && options.user !== self) fail(`only root can run as another user; this is ${self}`);
+    if (options.group !== null) fail("only root can run as another group");
+    return null;
+  }
+  if (!options.user) fail("refusing to run as root; pass --user USER");
+  if (options.group !== null) return { user: options.user, group: options.group };
+  // The user's primary group, as a login would give it: a group named after the user need
+  // not exist (Debian's nobody is in nogroup).
+  let gid = "";
+  try { gid = execFileSync("id", ["-g", "--", options.user], { encoding: "utf8" }).trim(); } catch { /* no such user */ }
+  if (!/^\d+$/.test(gid)) fail(`no such user ${options.user}`);
+  return { user: options.user, group: Number(gid) };
 }
 
 /** Run as --user from here on, once the key is read and the port bound. */
 function dropPrivileges() {
-  if (!options.user) return;
-  const group = options.group ?? options.user;
+  if (!runAs) return;
+  const { user, group } = runAs;
   try {
-    process.initgroups(options.user, group);
+    process.initgroups(user, group);
     process.setgid(group);
-    process.setuid(options.user);
+    process.setuid(user);
   } catch (e) {
-    fail(`could not run as ${options.user}:${group}: ${e.message}`);
+    fail(`could not run as ${user}:${group}: ${e.message}`);
   }
 }
 
-const server = createServer(tls, (req, res) => {
+const server = createServer(tls, async (req, res) => {
   const answer = (status) => { res.writeHead(status, { "Content-Length": 0 }); res.end(); };
   if (req.method !== "GET" && req.method !== "HEAD") { answer(405); return; }
   let path;
@@ -109,17 +135,28 @@ const server = createServer(tls, (req, res) => {
   if (path.includes("\0")) { answer(400); return; }
   // Resolved and then checked, so no spelling of `..` leaves the root.
   const file = resolve(root, "." + (path === "/" ? `/${options.index}` : path));
-  let stat = null;
-  try { if (file.startsWith(root + sep)) stat = statSync(file); } catch { /* no such file */ }
-  if (!stat?.isFile()) { answer(404); return; }
+  if (!file.startsWith(root + sep)) { answer(404); return; }
+  // Opened once and statted through the handle, without blocking the relay sockets this
+  // front also carries.
+  let handle = null, stat = null;
+  try {
+    handle = await open(file);
+    stat = await handle.stat();
+  } catch { /* no such file */ }
+  const close = () => handle?.close().catch(() => {});
+  if (!stat?.isFile()) { close(); answer(404); return; }
+  // Revalidated on every load, so a page is never run against a stale vendor/, and a file
+  // that has not changed is not sent again.
+  const etag = `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  const cache = { "Cache-Control": "no-cache", "ETag": etag };
+  if (req.headers["if-none-match"] === etag) { close(); res.writeHead(304, cache); res.end(); return; }
   res.writeHead(200, {
     "Content-Type": TYPES[extname(file).toLowerCase()] ?? "application/octet-stream",
     "Content-Length": stat.size,
-    // Revalidated on every load, so a page is never run against a stale vendor/.
-    "Cache-Control": "no-cache",
+    ...cache,
   });
-  if (req.method === "HEAD") { res.end(); return; }
-  createReadStream(file).on("error", () => res.destroy()).pipe(res);
+  if (req.method === "HEAD") { close(); res.end(); return; }
+  pipeline(handle.createReadStream(), res, () => {});
 });
 
 server.maxConnections = MAX_CONNS;

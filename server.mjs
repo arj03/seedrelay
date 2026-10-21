@@ -27,7 +27,7 @@
 //                          unless a host is named (default 3478; env RELAY_STUN)
 
 import { createSocket } from "node:dgram";
-import { createRelay, localAuthorities, parseOptions } from "./relay.mjs";
+import { bracket, createRelay, isLoopbackHost, localAuthorities, parseOptions } from "./relay.mjs";
 
 let options;
 try {
@@ -39,7 +39,6 @@ try {
 
 const relay = createRelay(options);
 const { host } = options;
-const bracket = (h) => (h.includes(":") && !h.startsWith("[") ? `[${h}]` : h);
 
 // Two ports, so a node can tell a NAT that gives each destination its own port: the two
 // answers then name different ones. Port 0 asks the OS for two.
@@ -79,9 +78,7 @@ relay.server.listen(options.port, host, () => {
     `IPv6 by /${l.ipv6Prefix}, registrations ${l.registerRate > 0 ? `${l.registerRate}/s per ip` : "unmetered"}, ` +
     `splices ${l.spliceRate > 0 ? `${l.spliceRate} KiB/s per ip` : "unmetered"}${relay.proxies.size ? " (X-Forwarded-For trusted)" : ""}`);
   console.log(`  heartbeat: ${l.heartbeatSecs > 0 ? `${l.heartbeatSecs}s ping/reap` : "disabled"}`);
-  if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1" && host !== "[::1]") {
-    console.log(`  ⚠  bound to ${host}: exposed to the network`);
-  }
+  if (!isLoopbackHost(host)) console.log(`  ⚠  bound to ${host || "every interface"}: exposed to the network`);
 });
 
 for (const signal of ["SIGTERM", "SIGINT"]) {

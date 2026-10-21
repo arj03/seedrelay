@@ -348,8 +348,9 @@ The front listens on `8443` unless given `--port`, serves `--root` with `index.h
 is `shell.html`), and dials the relay at `127.0.0.1:8080` unless given `--relay`. It
 reads the certificate once, so restart it after a renewal. Root is only for the key and
 the port: it reads one and binds the other, then runs as `--user` (and `--group`, default
-the same), so `--root` must be readable by that user. Started as root without `--user`, it
-refuses. It holds at most 256 sockets and gives a client 10 seconds for its headers and 60
+that user's primary group), so `--root` must be readable by that user. Started as root
+without `--user`, it refuses. Started as anyone else, it stays who it is: `--user` may name
+only that user, and `--group` none. It holds at most 256 sockets and gives a client 10 seconds for its headers and 60
 for its request, since the relay sees a client only once its headers are in. To the relay
 it is a proxy like any other: the authority carries the front's port, since it is not a
 default one, and the page's origin does too.

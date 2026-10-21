@@ -6,10 +6,12 @@ import { fileURLToPath } from "node:url";
 import { request } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { createSocket } from "node:dgram";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createRelay, localAuthorities, parseOptions, SPLICE_HOLD_MS, stunResponse } from "../relay.mjs";
 import { roomClient } from "../rooms.mjs";
 
 const SERVER = fileURLToPath(new URL("../server.mjs", import.meta.url));
+const WS_KEY = "AAAAAAAAAAAAAAAAAAAAAA==";
 
 // The relay's handlers driven with a controlled clock and fake sockets, so slow readers,
 // exact budget boundaries and timeouts are deterministic.
@@ -22,6 +24,8 @@ class Socket extends EventEmitter {
   full = false;       // a slow reader: writes report the buffer full until `drain`
   writes = [];
   write(bytes) { this.writes.push(Buffer.from(bytes)); return !this.full; }
+  cork() {}
+  uncork() {}
   pause() { this.paused = true; }
   resume() { this.paused = false; }
   end() { this.ended = true; }
@@ -52,7 +56,7 @@ function fixture(args = []) {
   function upgrade(s, { path = "/v1/", headers = {}, head } = {}) {
     relay.upgrade({ method: "GET", url: path, headers: {
       upgrade: "websocket", "sec-websocket-version": "13", host: "relay.test",
-      "sec-websocket-key": "AAAAAAAAAAAAAAAAAAAAAA==", ...headers,
+      "sec-websocket-key": WS_KEY, ...headers,
     } }, s, head);
     return s;
   }
@@ -109,20 +113,22 @@ function frame(opcode, payload = Buffer.alloc(0), mask = Buffer.from([1, 2, 3, 4
   for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
   return Buffer.concat([h, body]);
 }
-/** The server frames written to a fake socket after its 101 response. */
-function serverFrames(sock) {
-  const bytes = Buffer.concat(sock.writes.slice(1));
-  const out = [];
-  for (let off = 0; off + 2 <= bytes.length;) {
-    let len = bytes[off + 1] & 0x7f, h = 2;
-    if (len === 126) { len = bytes.readUInt16BE(off + 2); h = 4; }
-    else if (len === 127) { len = Number(bytes.readBigUInt64BE(off + 2)); h = 10; }
+/** The server frames whole in `bytes`, and how many bytes they take. */
+function parseFrames(bytes) {
+  const frames = [];
+  let off = 0;
+  while (off + 2 <= bytes.length) {
+    const len7 = bytes[off + 1] & 0x7f, h = len7 === 126 ? 4 : len7 === 127 ? 10 : 2;
+    if (off + h > bytes.length) break;
+    const len = len7 === 126 ? bytes.readUInt16BE(off + 2) : len7 === 127 ? Number(bytes.readBigUInt64BE(off + 2)) : len7;
     if (off + h + len > bytes.length) break;
-    out.push({ b0: bytes[off], opcode: bytes[off] & 0x0f, payload: bytes.subarray(off + h, off + h + len) });
+    frames.push({ b0: bytes[off], opcode: bytes[off] & 0x0f, payload: bytes.subarray(off + h, off + h + len) });
     off += h + len;
   }
-  return out;
+  return { frames, used: off };
 }
+/** The server frames written to a fake socket after its 101 response. */
+const serverFrames = (sock) => parseFrames(Buffer.concat(sock.writes.slice(1))).frames;
 const status = (sock) => Number(/^HTTP\/1\.1 (\d+)/.exec(sock.writes[0]?.toString() ?? "")?.[1]);
 const typed = (sock) => serverFrames(sock).filter((f) => f.opcode === 2).map((f) => f.payload);
 const ofType = (sock, type) => typed(sock).filter((p) => p[0] === type);
@@ -136,16 +142,14 @@ function identity() {
   return { pk: publicKey.export({ format: "der", type: "spki" }).subarray(12), key: privateKey };
 }
 const DOMAINS = Buffer.from("seedkernel-link-scope-v1\0seedkernel-relay-register-v1\0");
+const ROOMS_DOMAIN = Buffer.from("seedrelay-rooms-v1\0");
 /** A control socket's registration, with its MAC under `secret` when one is given. */
-function registration(id, authority, nonce, secret) {
-  const sig = sign(null, Buffer.concat([DOMAINS, Buffer.from(authority), nonce]), id.key);
+function registration(id, authority, nonce, secret, domain = DOMAINS) {
+  const sig = sign(null, Buffer.concat([domain, Buffer.from(authority), nonce]), id.key);
   return Buffer.concat([Buffer.of(1), id.pk, sig, secretMac(secret, id.pk, sig)]);
 }
 /** A room socket's registration: the app signs under the rooms tag itself. */
-function roomRegistration(id, authority, nonce, secret) {
-  const sig = sign(null, Buffer.concat([Buffer.from("seedrelay-rooms-v1\0"), Buffer.from(authority), nonce]), id.key);
-  return Buffer.concat([Buffer.of(1), id.pk, sig, secretMac(secret, id.pk, sig)]);
-}
+const roomRegistration = (id, authority, nonce, secret) => registration(id, authority, nonce, secret, ROOMS_DOMAIN);
 /** BLAKE2b-512, unkeyed: what libsodium's `crypto_generichash(64, m)` and seedkernel's
  *  `crypto/blake2b` give. */
 const blake2b = (m) => createHash("blake2b512").update(m).digest();
@@ -270,7 +274,8 @@ test("malformed or unknown options fail at startup instead of falling back", () 
     assert.throws(() => parseOptions(["--host", h]), /--authority/, `wildcard ${JSON.stringify(h)}`);
   }
   assert.equal(parseOptions(["--host", "", "--authority", "relay.lan:8080"]).host, "");
-  assert.deepEqual(localAuthorities("[::1]", 8080), ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"]);
+  assert.equal(parseOptions(["--host", "[::1]"]).host, "::1", "a host loses its URL brackets");
+  assert.deepEqual(localAuthorities("::1", 8080), ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"]);
   assert.equal(parseOptions(["--host", "::", "--authority", "relay.lan:8080"]).host, "::");
   for (const args of [["--register-rate", " "], ["--splice-rate", " "], ["--heartbeat-secs", " "], ["--port", " "]]) {
     assert.throws(() => parseOptions(args), Error, `whitespace ${args.join(" ")}`);
@@ -822,14 +827,29 @@ async function startRelay(t, args = [], env = {}, ...more) {
   return { output, port: Number(/listening on ws:\/\/127\.0\.0\.1:(\d+)\/v1\//.exec(output)[1]) };
 }
 
+/** A WebSocket upgrade request to `path` on `host`:`port`. */
+const upgradeRequest = (host, port, path) => request({ host, port, path, headers: {
+  Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": WS_KEY,
+} });
+
+/** A rooms.mjs client of the relay on `port` as `id`, closed when `t` ends. */
+function roomClientFor(t, port, id, options) {
+  const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key),
+    WebSocket: TestWebSocket, ...options });
+  t.after(() => c.close());
+  return c;
+}
+
+/** Resolves once `pred()` holds. */
+async function waitFor(pred) {
+  while (!pred()) await sleep(10);
+}
+
 test("real sockets: register, call and splice through a running relay", { timeout: 10000 }, async (t) => {
   const { output, port } = await startRelay(t, ["--stun", "127.0.0.1:0"], {}, /STUN on udp/);
   const stunPort = Number(/STUN on udp:\/\/127\.0\.0\.1:(\d+)/.exec(output)[1]);
   const open = (path) => new Promise((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, path, headers: {
-      Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13",
-      "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
-    } });
+    const req = upgradeRequest("127.0.0.1", port, path);
     req.once("error", reject);
     req.once("upgrade", (_res, socket, head) => {
       t.after(() => socket.destroy());
@@ -840,7 +860,7 @@ test("real sockets: register, call and splice through a running relay", { timeou
     req.once("response", (res) => { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); });
     req.end();
   });
-  const frames = (s) => serverFrames({ writes: [Buffer.alloc(0), s.got] });
+  const frames = (s) => parseFrames(s.got).frames;
   const until = async (s, pred) => { while (!pred(frames(s))) await once(s, "got"); return frames(s); };
   const register = async (s, id) => {
     const [c] = await until(s, (fs) => fs.length >= 1);
@@ -871,20 +891,16 @@ test("real sockets: register, call and splice through a running relay", { timeou
 
   // Two apps meet in a room through rooms.mjs, as seedshell and seedstore do.
   const heard = [];
-  const client = (id) => {
-    const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key),
-      onMember: (room, key, present) => heard.push([id.pk.toString("hex"), room, key, present]), WebSocket: TestWebSocket });
-    t.after(() => c.close());
-    return c;
-  };
+  const client = (id) => roomClientFor(t, port, id,
+    { onMember: (room, key, present) => heard.push([id.pk.toString("hex"), room, key, present]) });
   const ra = client(ida), rb = client(idb);
   await ra.join("lobby");
   await rb.join("lobby");
   const saw = (who, key, present) => heard.some(([w, room, k, p]) => w === who && room === "lobby" && k === key && p === present);
   const [ha, hb] = [ida.pk.toString("hex"), idb.pk.toString("hex")];
-  while (!(saw(ha, hb, true) && saw(hb, ha, true))) await new Promise((r) => setTimeout(r, 10));
+  await waitFor(() => saw(ha, hb, true) && saw(hb, ha, true));
   await rb.leave("lobby");
-  while (!saw(ha, hb, false)) await new Promise((r) => setTimeout(r, 10));
+  await waitFor(() => saw(ha, hb, false));
 });
 
 test("real sockets: rooms.mjs proves the secret of a relay started with one", { timeout: 10000 }, async (t) => {
@@ -892,13 +908,8 @@ test("real sockets: rooms.mjs proves the secret of a relay started with one", { 
   const { output, port } = await startRelay(t, [], { RELAY_SECRETS: secret });
   assert.match(output, /registration: needs a secret/);
   const heard = [];
-  const client = (id) => {
-    const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key), secret,
-      blake2b, onMember: (room, key, present) => heard.push([id.pk.toString("hex"), key, present]),
-      WebSocket: TestWebSocket });
-    t.after(() => c.close());
-    return c;
-  };
+  const client = (id) => roomClientFor(t, port, id,
+    { secret, blake2b, onMember: (_room, key, present) => heard.push([id.pk.toString("hex"), key, present]) });
   assert.throws(() => roomClient({ relay: "ws://127.0.0.1:1", publicKey: Buffer.alloc(32), sign, secret }),
     /a secret needs blake2b/);
   const ida = identity(), idb = identity();
@@ -906,7 +917,7 @@ test("real sockets: rooms.mjs proves the secret of a relay started with one", { 
   await client(idb).join("lobby");
   const [ha, hb] = [ida.pk.toString("hex"), idb.pk.toString("hex")];
   const saw = (who, key) => heard.some(([w, k, p]) => w === who && k === key && p);
-  while (!(saw(ha, hb) && saw(hb, ha))) await new Promise((r) => setTimeout(r, 10));
+  await waitFor(() => saw(ha, hb) && saw(hb, ha));
 });
 
 /** Just enough of a browser WebSocket over node:http for rooms.mjs: binary messages in and
@@ -914,19 +925,15 @@ test("real sockets: rooms.mjs proves the secret of a relay started with one", { 
 class TestWebSocket {
   constructor(url) {
     const u = new URL(url);
-    const req = request({ host: u.hostname, port: u.port, path: u.pathname, headers: {
-      Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13",
-      "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
-    } });
+    const req = upgradeRequest(u.hostname, u.port, u.pathname);
     req.once("upgrade", (_res, socket, head) => {
       this.socket = socket;
       let buf = Buffer.from(head);
       const take = (d) => {
         buf = Buffer.concat([buf, d]);
-        for (;;) {
-          const [f] = serverFrames({ writes: [Buffer.alloc(0), buf] });
-          if (!f) return;
-          buf = buf.subarray((f.payload.length < 126 ? 2 : f.payload.length < 65536 ? 4 : 10) + f.payload.length);
+        const { frames, used } = parseFrames(buf);
+        buf = buf.subarray(used);
+        for (const f of frames) {
           if (f.opcode === 2) this.onmessage?.({ data: f.payload.buffer.slice(f.payload.byteOffset, f.payload.byteOffset + f.payload.length) });
         }
       };

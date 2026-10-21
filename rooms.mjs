@@ -10,7 +10,7 @@ const DOMAIN_SECRET = utf8("seedrelay-secret-v1\0");
 const ROOM_TAG = utf8("seedrelay-room-v1\0");
 const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_JOIN = 0x02, T_LEAVE = 0x03,
   T_MEMBERS = 0x02, T_JOINED = 0x03, T_LEFT = 0x04, T_REFUSED = 0x07;
-const ID_LEN = 32, NONCE_LEN = 32;
+const ID_LEN = 32, PK_LEN = 32, NONCE_LEN = 32;
 /** A dropped relay is dialed again after a wait that starts here and doubles with each
  *  drop in a row, drawn from its upper half so a relay's clients do not all come back at
  *  once. */
@@ -55,7 +55,7 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
   const forget = (id) => {
     const keys = heard.get(id);
     heard.delete(id);
-    for (const key of keys ?? []) onMember(wanted.get(id), key, false);
+    for (const key of keys) onMember(wanted.get(id), key, false);
   };
 
   /** A message on `sock`, which by the time a signature is made may no longer be `ws`. */
@@ -73,17 +73,17 @@ export function roomClient({ relay, publicKey, sign, secret = null, blake2b = nu
       retryMs = RETRY_MS;
       for (const id of wanted.keys()) ask(id);
     } else if ((type === T_MEMBERS || type === T_JOINED || type === T_LEFT) &&
-        body.length >= ID_LEN && (body.length - ID_LEN) % 32 === 0) {
+        body.length >= ID_LEN && (body.length - ID_LEN) % PK_LEN === 0) {
       const id = hex(body.subarray(0, ID_LEN)), keys = heard.get(id);
       if (!keys) return; // a room left since
+      const named = [];
+      for (let off = ID_LEN; off < body.length; off += PK_LEN) named.push(hex(body.subarray(off, off + PK_LEN)));
       if (type === T_MEMBERS) {
         // The room as it stands: a key heard before a redial that is not in it has left.
-        const there = new Set();
-        for (let off = ID_LEN; off < body.length; off += 32) there.add(hex(body.subarray(off, off + 32)));
+        const there = new Set(named);
         for (const key of [...keys]) if (!there.has(key) && keys.delete(key)) onMember(wanted.get(id), key, false);
       }
-      for (let off = ID_LEN; off < body.length; off += 32) {
-        const key = hex(body.subarray(off, off + 32));
+      for (const key of named) {
         const changed = type === T_LEFT ? keys.delete(key) : !keys.has(key) && keys.add(key);
         if (changed) onMember(wanted.get(id), key, type !== T_LEFT);
       }

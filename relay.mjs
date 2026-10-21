@@ -98,7 +98,7 @@ export function parseOptions(argv, env = {}) {
     return n;
   };
   const list = (value) => (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  for (const [flag, [name, variable, max]] of Object.entries(LIMIT_FLAGS)) {
+  for (const [name, variable, max] of Object.values(LIMIT_FLAGS)) {
     if (env[variable] !== undefined) options.limits[name] = number(variable, env[variable], max);
   }
   for (const a of list(env.RELAY_AUTHORITIES)) options.authorities.push(authorityOption(a));
@@ -122,7 +122,7 @@ export function parseOptions(argv, env = {}) {
     };
     if (a in LIMIT_FLAGS) options.limits[LIMIT_FLAGS[a][0]] = number(a, value(), LIMIT_FLAGS[a][2]);
     else if (a === "--port") options.port = number(a, value(), 65535);
-    else if (a === "--host") options.host = value();
+    else if (a === "--host") options.host = unbracket(value());
     else if (a === "--authority") options.authorities.push(authorityOption(value()));
     else if (a === "--allow-origin") options.allowOrigins.push(value());
     else if (a === "--trusted-proxy") options.trustedProxies.push(proxyOption(value()));
@@ -172,31 +172,31 @@ function proxyOption(value) {
 /** Whether binding `host` listens on every interface. Node treats an empty host and every
  *  spelling of an unspecified address as a wildcard, so the --authority guard must too. */
 function isWildcardHost(host) {
-  if (host === "") return true;
-  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-  const ip = normalizeIp(bare);
-  return ip === "0.0.0.0" || ip === "::";
+  const ip = normalizeIp(host);
+  return host === "" || ip === "0.0.0.0" || ip === "::";
+}
+
+const LOOPBACK_NAMES = ["localhost", "127.0.0.1", "::1"];
+
+/** Whether `host`, as `parseOptions` gives it, is reachable from this machine only. */
+export function isLoopbackHost(host) {
+  const ip = normalizeIp(host);
+  return host === "localhost" || ip === "::1" || /^127\./.test(ip ?? "");
 }
 
 /** The names a relay bound to `host` answers to when none are given: the loopback names
  *  on a loopback address, else the address itself. A relay nodes reach under any other
  *  name (a public one, behind a proxy), or bound to every interface, needs `--authority`. */
 export function localAuthorities(host, port) {
-  const at = (h) => {
-    const bare = h.startsWith("[") && h.endsWith("]") ? h.slice(1, -1) : h;
-    return canonicalAuthority(`${bare.includes(":") ? `[${bare}]` : bare}:${port}`);
-  };
-  if (host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host)) {
-    return ["localhost", "127.0.0.1", "::1"].map(at);
-  }
-  return [at(host)];
+  const names = isLoopbackHost(host) ? LOOPBACK_NAMES : [normalizeIp(host) ?? host];
+  return names.map((name) => canonicalAuthority(`${bracket(name)}:${port}`));
 }
 
 // Opaque origins (including file pages and sandboxed iframes) are not allowed by default.
 // Operators can explicitly opt in with --allow-origin null.
 const LOCAL_ORIGINS = [];
 for (const scheme of ["http", "https"]) {
-  for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
+  for (const host of LOOPBACK_NAMES.map(bracket)) {
     LOCAL_ORIGINS.push(`${scheme}://${host}`);
     for (const port of [80, 443, 3000, 5173, 8000, 8080, 8443]) LOCAL_ORIGINS.push(`${scheme}://${host}:${port}`);
   }
@@ -230,13 +230,7 @@ const CLOSE_RESTART = 1012;
 const REFUSALS = { 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 409: "Conflict",
   421: "Misdirected Request", 429: "Too Many Requests", 503: "Service Unavailable" };
 
-const realClock = {
-  now: () => performance.now(),
-  setTimeout: (fn, ms) => setTimeout(fn, ms),
-  clearTimeout: (t) => clearTimeout(t),
-  setInterval: (fn, ms) => setInterval(fn, ms),
-  clearInterval: (t) => clearInterval(t),
-};
+const realClock = { now: () => performance.now(), setTimeout, clearTimeout, setInterval, clearInterval };
 
 /** A timer that does not keep the process alive. */
 function later(clock, fn, ms) {
@@ -324,18 +318,31 @@ function writeFrame(sock, frame) {
 /** End a socket gracefully, so what is queued for it still goes out, and give up on the
  *  far end after SPLICE_WAIT_MS. */
 function endSoon(clock, sock) {
+  if (sock.destroyed) return;
   sock.end();
-  later(clock, () => sock.destroy(), SPLICE_WAIT_MS);
+  const t = later(clock, () => sock.destroy(), SPLICE_WAIT_MS);
+  sock.once("close", () => clock.clearTimeout(t));
 }
 
 // ─── addresses ───────────────────────────────────────────────────────────
+
+/** A host without the brackets a URL puts around an IPv6 address. */
+function unbracket(host) {
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
+/** A host as a URL or an authority names it: an IPv6 address in brackets. */
+export function bracket(host) {
+  return host.includes(":") ? `[${host}]` : host;
+}
 
 /** An IP address in one spelling: IPv4 dotted, IPv4-mapped IPv6 as IPv4, other IPv6 as
  *  URL hosts compress it. Null for anything else, scoped IPv6 included, which is a valid
  *  `isIP` but neither a URL host nor a portable forwarded address. */
 function normalizeIp(value) {
-  if (value.includes("%") || !isIP(value)) return null;
-  if (isIP(value) === 4) return value;
+  const version = value.includes("%") ? 0 : isIP(value);
+  if (version === 0) return null;
+  if (version === 4) return value;
   const normalized = new URL(`http://[${value}]/`).hostname.slice(1, -1);
   const mapped = /^::ffff:([0-9a-f]+):([0-9a-f]+)$/.exec(normalized);
   if (!mapped) return normalized;
@@ -620,8 +627,10 @@ class Room {
    *  another socket already holds it here. */
   join(conn) {
     const known = new Map();
-    for (const c of this.conns) if (c.key !== conn.key) known.set(c.key, c.pk);
-    const already = this.holds(conn.key);
+    let already = false;
+    for (const c of this.conns) {
+      if (c.key === conn.key) already = true; else known.set(c.key, c.pk);
+    }
     this.conns.add(conn);
     if (!conn.send(typed(T_MEMBERS, this.idBytes, ...known.values()))) return false;
     if (!already) this.tell(T_JOINED, conn);
@@ -715,23 +724,20 @@ class ControlConn {
     }
     // Anything else, including a join or a call before registering or on the other kind
     // of socket, is not this wire.
-    this.relay.log("! dropped: unexpected control frame");
+    return this.drop("unexpected control frame");
+  }
+
+  /** Tear the socket down for `why`: false, which stops the read. */
+  drop(why) {
+    this.relay.log(`! dropped: ${why}`);
     this.sock.destroy();
     return false;
   }
 
   register(pk, sig, mac) {
     const { relay } = this;
-    if (!relay.admits(pk, sig, mac)) {
-      relay.log("! dropped: no secret");
-      this.sock.destroy();
-      return false;
-    }
-    if (!verifyRegistration(this.forRooms, pk, sig, this.authority, this.nonce)) {
-      relay.log("! dropped: bad registration");
-      this.sock.destroy();
-      return false;
-    }
+    if (!relay.admits(pk, sig, mac)) return this.drop("no secret");
+    if (!verifyRegistration(this.forRooms, pk, sig, this.authority, this.nonce)) return this.drop("bad registration");
     relay.clock.clearTimeout(this.registerTimer);
     this.pk = Buffer.from(pk);
     this.key = this.pk.toString("hex");
@@ -810,14 +816,13 @@ class ControlConn {
 const MAX_SPLICES_PER_CALLEE = 8;
 
 class Splice {
-  constructor(relay, from, calleeKey, ticket) {
+  constructor(relay, from, pair, ticket) {
     this.relay = relay;
     this.from = from;                    // the caller's address, which both ends are charged to
-    this.pair = `${from} ${calleeKey}`;
+    this.pair = pair;                    // that address and the callee's key, as splicesTo counts them
     this.ticket = ticket;
     this.calleeTicket = randomBytes(TICKET_LEN).toString("hex");
-    this.ends = { caller: null, callee: null };
-    this.live = 0;                       // sockets that came and have not closed
+    this.ends = { caller: null, callee: null }; // sockets that came and have not closed
     this.over = false;                   // joined or expired: its tickets are spent
     relay.pending.set(ticket, { splice: this, role: "caller" });
     relay.pending.set(this.calleeTicket, { splice: this, role: "callee" });
@@ -828,14 +833,12 @@ class Splice {
 
   attach(end) {
     this.ends[end.role] = end;
-    this.live++;
     if (this.ends.caller && this.ends.callee) this.join();
   }
 
   detach(end) {
-    this.live--;
-    if (!this.over) this.ends[end.role] = null;
-    else if (this.live === 0) this.release();
+    this.ends[end.role] = null;
+    if (this.over && !this.ends.caller && !this.ends.callee) this.release();
   }
 
   settle() {
@@ -849,8 +852,9 @@ class Splice {
   expire() {
     if (this.over) return;
     this.settle();
-    if (this.live === 0) this.release();
-    for (const end of Object.values(this.ends)) end?.sock.destroy();
+    const ends = Object.values(this.ends);
+    if (!ends.some(Boolean)) this.release();
+    for (const end of ends) end?.sock.destroy();
   }
 
   /** Called once, when it is over and its last socket gone: nothing attaches once over. */
@@ -880,9 +884,8 @@ class SpliceEnd {
     this.mid = false;          // a frame forwarded to this socket is partly written
     this.alive = true;         // cleared each heartbeat, set on pong or on anything sent
     this.holds = 1;            // paused until joined
-    this.waiting = false;      // held until the far end drains
     this.metered = false;      // held until its address's budget recovers
-    this.holdTimer = null;     // gives up on a far end that does not drain
+    this.holdTimer = null;     // held until the far end drains, and gives up on one that does not
     this.early = head?.length ? Buffer.from(head) : null; // what came with the upgrade
     this.reader = new FrameReader(this, SPLICE_FRAMES);
     sock.pause();
@@ -895,6 +898,7 @@ class SpliceEnd {
     this.far = far;
     this.linked = true;
     this.sock.on("data", (chunk) => this.take(chunk));
+    far.sock.on("drain", () => this.drained());
     if (this.early) this.take(this.early);
     this.early = null;
     this.release();
@@ -912,8 +916,27 @@ class SpliceEnd {
 
   take(chunk) {
     this.alive = true;
-    if (!this.reader.push(chunk)) { this.sock.destroy(); this.far.sock.destroy(); return; }
-    this.relay.meter(this, chunk.length);
+    // What one chunk carries, headers and payloads, goes to the far end in one write.
+    const dst = this.far.sock;
+    dst.cork();
+    const ok = this.reader.push(chunk);
+    dst.uncork();
+    if (!ok) { this.sock.destroy(); dst.destroy(); return; }
+    this.meter(chunk.length);
+  }
+
+  // What an address sends through its splices is metered, spliceRate KiB/s with two
+  // seconds of burst. Past it, the address's splice sockets are not read until the debt
+  // is paid back, so a sender is slowed, not cut off.
+  meter(n) {
+    const budgets = this.relay.spliceBudgets;
+    if (!budgets) return;
+    const b = budgets.get(this.addr);
+    b.charge(n);
+    if (b.tokens >= 0 || this.metered) return;
+    this.metered = true;
+    this.hold();
+    later(this.relay.clock, () => { this.metered = false; this.release(); }, -b.tokens * 1000 / b.rate);
   }
 
   /** Write to the far end; a far end that cannot take more holds this one until it drains,
@@ -921,16 +944,17 @@ class SpliceEnd {
   forward(bytes) {
     const dst = this.far.sock;
     if (dst.destroyed || !dst.writable) return;
-    if (!dst.write(bytes) && !this.waiting) {
-      this.waiting = true;
+    if (!dst.write(bytes) && this.holdTimer === null) {
       this.hold();
       this.holdTimer = later(this.relay.clock, () => { this.sock.destroy(); dst.destroy(); }, SPLICE_HOLD_MS);
-      dst.once("drain", () => {
-        this.relay.clock.clearTimeout(this.holdTimer);
-        this.waiting = false;
-        this.release();
-      });
     }
+  }
+
+  drained() {
+    if (this.holdTimer === null) return;
+    this.relay.clock.clearTimeout(this.holdTimer);
+    this.holdTimer = null;
+    this.release();
   }
 
   // Data frames are copied to the far end as server frames, streaming: a frame's header
@@ -1027,9 +1051,10 @@ class Relay {
     this.proxies = new Set(trustedProxies.map(proxyOption));
     this.secrets = secrets.map((secret) => Buffer.from(secret));
 
-    // Every accepted TCP socket, to `{ account, timer, conn }`: the address it is charged
-    // to (none for a trusted proxy before its client is known), its handshake deadline,
-    // and its ControlConn or SpliceEnd once upgraded. `charges` counts sockets by address.
+    // Every accepted TCP socket, to `{ ip, account, timer, conn }`: the address it connects
+    // from, the address it is charged to (none for a trusted proxy before its client is
+    // known), its handshake deadline, and its ControlConn or SpliceEnd once upgraded.
+    // `charges` counts sockets by address.
     this.connections = new Map();
     this.charges = new Map();
     this.rooms = new Map();
@@ -1080,10 +1105,14 @@ class Relay {
     return true;
   }
 
-  // Walk from the actual remote address toward the client, stopping at the first
+  /** The client an address is accounted as, by this relay's IPv6 prefix. */
+  addressOf(ip) {
+    return addressKey(ip, this.limits.ipv6Prefix);
+  }
+
+  // Walk from the actual remote address `ip` toward the client, stopping at the first
   // untrusted hop. Never trust a client-supplied leftmost XFF value.
-  clientIp(req, sock) {
-    let ip = normalizeIp(sock.remoteAddress ?? "") ?? "unknown";
+  clientIp(req, ip) {
     if (this.proxies.has(ip)) {
       const xff = req.headers["x-forwarded-for"];
       if (typeof xff !== "string" || !xff) return null;
@@ -1108,9 +1137,9 @@ class Relay {
   // global cap here; their forwarded clients are charged at upgrade.
   connection(sock) {
     const ip = normalizeIp(sock.remoteAddress ?? "") ?? "unknown";
-    const entry = { account: null, timer: null, conn: null };
+    const entry = { ip, account: null, timer: null, conn: null };
     if (this.connections.size >= this.limits.maxConns ||
-        (!this.proxies.has(ip) && !this.bill(entry, addressKey(ip, this.limits.ipv6Prefix)))) {
+        (!this.proxies.has(ip) && !this.bill(entry, this.addressOf(ip)))) {
       sock.destroy();
       return;
     }
@@ -1150,9 +1179,9 @@ class Relay {
       this.refuse(sock, target, target === 404 ? "not a path of the wire this relay speaks" : "bad ticket");
       return;
     }
-    const ip = this.clientIp(req, sock);
+    const ip = this.clientIp(req, entry.ip);
     if (ip === null) { this.refuse(sock, 400, "invalid proxy address chain"); return; }
-    const addr = addressKey(ip, this.limits.ipv6Prefix);
+    const addr = this.addressOf(ip);
 
     if (target.splice !== null) {
       // A splice socket needs a ticket a call handed out, and is charged to its caller.
@@ -1222,30 +1251,17 @@ class Relay {
     const hex = ticket.toString("hex"), pair = `${caller.addr} ${calleeKey}`;
     if (this.pending.has(hex) || (this.callsFrom.get(caller.addr) ?? 0) >= this.limits.maxPerRoom ||
         (this.splicesTo.get(pair) ?? 0) >= MAX_SPLICES_PER_CALLEE) return null;
-    return new Splice(this, caller.addr, calleeKey, hex);
+    return new Splice(this, caller.addr, pair, hex);
   }
 
   /** The answer to a datagram on the STUN port from `address`:`port`, or null. */
   stun(msg, address, port) {
     const ip = normalizeIp(address);
     if (!ip) return null;
-    const addr = addressKey(ip, this.limits.ipv6Prefix);
+    const addr = this.addressOf(ip);
     if (!this.stunBudgets.has(addr) && !this.stunNewAddresses.spend(1)) return null;
     if (!this.stunBudgets.get(addr).spend(1)) return null;
     return stunResponse(msg, ip, port);
-  }
-
-  // What an address sends through its splices is metered, spliceRate KiB/s with two
-  // seconds of burst. Past it, the address's splice sockets are not read until the debt
-  // is paid back, so a sender is slowed, not cut off.
-  meter(end, n) {
-    if (!this.spliceBudgets) return;
-    const b = this.spliceBudgets.get(end.addr);
-    b.charge(n);
-    if (b.tokens >= 0 || end.metered) return;
-    end.metered = true;
-    end.hold();
-    later(this.clock, () => { end.metered = false; end.release(); }, -b.tokens * 1000 / b.rate);
   }
 
   /** Tell every socket the relay is restarting (close code 1012) and end it, and drop
