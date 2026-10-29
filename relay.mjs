@@ -231,8 +231,7 @@ export async function startRelay(options, log = (line) => console.log(line)) {
   const { shell, transport } = await bootShell({
     sodium,
     identity: sodium.crypto_sign_keypair(),
-    fs: false,
-    transport: {
+    services: { transport: {
       bundle: readFileSync(RELAY_BUNDLE),
       listen: [{ label: "ws", host: options.host, port: options.port }],
       config: relayConfig(options),
@@ -240,7 +239,7 @@ export async function startRelay(options, log = (line) => console.log(line)) {
       datagrams: nodeDatagrams(),
       onStatus: (line) => log(new TextDecoder().decode(line)),
       suppressLinkLog: true,
-    },
+    } },
   });
   try {
     const port = transport.portOf("ws");
