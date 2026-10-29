@@ -1,11 +1,14 @@
-// The app side of a seedrelay's rooms (relay.mjs): an app meets other keys in rooms, and
-// hands the ones it meets to its seedkernel transport as `relay+` addresses, which the
+// The app side of a seedrelay's rooms (guest/relay.js): an app meets other keys in rooms,
+// and hands the ones it meets to its seedkernel transport as `relay+` addresses, which the
 // transport reaches through its own control socket. Rooms are discovery only; the
 // transport knows nothing of them. Browser and Node alike: it needs WebSocket, WebCrypto's
 // SHA-256, and a way to sign with the node's key; on a private relay, BLAKE2b too.
 
 const utf8 = (s) => new TextEncoder().encode(s);
-const DOMAIN_ROOMS = utf8("seedrelay-rooms-v1\0");
+// A room socket's registration is signed under seedkernel's link scope, which the relay
+// checks it under, and a tag of its own after it, so it never stands for the transport's
+// registration of a control socket, nor that for it.
+const DOMAIN_ROOMS = utf8("seedkernel-link-scope-v1\0seedrelay-rooms-v1\0");
 const DOMAIN_SECRET = utf8("seedrelay-secret-v1\0");
 const ROOM_TAG = utf8("seedrelay-room-v1\0");
 const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_JOIN = 0x02, T_LEAVE = 0x03,

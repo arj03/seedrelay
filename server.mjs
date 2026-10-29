@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-// The seedrelay bin: the relay (relay.mjs) on a port. On SIGTERM or SIGINT it tells every
-// socket the relay is restarting (close code 1012) before it exits.
+// The seedrelay bin: the relay bundle (bundle/relay.skb) on a seedkernel node in this
+// process, on a port. On SIGTERM or SIGINT it tells every socket the relay is restarting
+// (close code 1012) before it exits. `--print-config` prints the settings the flags make,
+// as the JSON a native node takes with `--transport-config`, and exits.
 //
 // Run: seedrelay [port] [options]  (or: node server.mjs)
 //   --port N               port to listen on (default 8080; a bare number works too)
@@ -23,70 +25,53 @@
 //   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
 //   --secret SECRET        register only nodes and apps given this secret, 16+ characters,
 //                          no commas (repeatable; env RELAY_SECRETS, which keeps it out of `ps`)
-//   --stun [HOST:]PORT|off answer STUN on this UDP port and the next, on every interface
-//                          unless a host is named (default 3478; env RELAY_STUN)
+//   --stun PORT|off        answer STUN on this UDP port and the next, on every interface
+//                          (default 3478; 0 for two the OS picks; env RELAY_STUN)
+//   --print-config         print the settings as a native node's --transport-config, and exit
 
-import { createSocket } from "node:dgram";
-import { bracket, createRelay, isLoopbackHost, localAuthorities, parseOptions } from "./relay.mjs";
+import { bracket, DEFAULT_LIMITS, isLoopbackHost, localAuthorities, parseOptions, relayConfig, startRelay } from "./relay.mjs";
 
+const args = process.argv.slice(2);
+const printConfig = args.includes("--print-config");
 let options;
 try {
-  options = parseOptions(process.argv.slice(2), process.env);
+  options = parseOptions(args.filter((a) => a !== "--print-config"), process.env);
 } catch (e) {
   console.error(`seedrelay: ${e.message}`);
   process.exit(2);
 }
 
-const relay = createRelay(options);
-const { host } = options;
-
-// Two ports, so a node can tell a NAT that gives each destination its own port: the two
-// answers then name different ones. Port 0 asks the OS for two.
-const udp = [];
-if (options.stun) {
-  for (const port of options.stun.port === 0 ? [0, 0] : [options.stun.port, options.stun.port + 1]) {
-    const socket = createSocket(options.stun.host.includes(":") ? "udp6" : "udp4");
-    let listening = false;
-    socket.on("message", (msg, from) => {
-      const answer = relay.stun(msg, from.address, from.port);
-      // With a callback, a reply that cannot be sent (to a forged source, say) is dropped
-      // instead of becoming an 'error' on the socket.
-      if (answer) socket.send(answer, from.port, from.address, () => {});
-    });
-    socket.on("error", (e) => {
-      // Before bind this is a startup failure; afterwards a send or interface error only
-      // costs STUN, not the relay's WebSocket service.
-      if (!listening) { console.error(`seedrelay: STUN: ${e.message}`); process.exit(1); }
-      console.error(`seedrelay: STUN: ${e.message} (continuing)`);
-    });
-    socket.bind(port, options.stun.host, () => {
-      listening = true;
-      console.log(`  STUN on udp://${bracket(options.stun.host)}:${socket.address().port}`);
-    });
-    udp.push(socket);
-  }
+if (printConfig) {
+  const config = relayConfig(options);
+  if (config.authorities.length === 0) config.authorities = localAuthorities(options.host, options.port);
+  console.log(JSON.stringify(config, null, 2));
+  process.exit(0);
 }
-relay.server.listen(options.port, host, () => {
-  const port = relay.server.address().port;
-  if (relay.authorities.size === 0) for (const name of localAuthorities(host, port)) relay.authorities.add(name);
-  const l = relay.limits;
-  console.log(`seedrelay listening on ws://${bracket(host)}:${port}/v1/`);
-  console.log(`  answers to: ${[...relay.authorities].join(", ")}`);
-  console.log(`  origin allowlist: ${[...relay.origins].slice(0, 4).join(", ")}…`);
-  console.log(`  registration: ${relay.secrets.length ? `needs a secret (${relay.secrets.length} accepted)` : "open to any key"}`);
-  console.log(`  limits: ${l.maxConns} conns, ${l.maxRooms} rooms, ${l.maxPerRoom}/room, ${l.maxPerIp}/ip, ${l.maxPerRoomIp}/ip in a room, ` +
-    `IPv6 by /${l.ipv6Prefix}, registrations ${l.registerRate > 0 ? `${l.registerRate}/s per ip` : "unmetered"}, ` +
-    `splices ${l.spliceRate > 0 ? `${l.spliceRate} KiB/s per ip` : "unmetered"}${relay.proxies.size ? " (X-Forwarded-For trusted)" : ""}`);
-  console.log(`  heartbeat: ${l.heartbeatSecs > 0 ? `${l.heartbeatSecs}s ping/reap` : "disabled"}`);
-  if (!isLoopbackHost(host)) console.log(`  ⚠  bound to ${host || "every interface"}: exposed to the network`);
-});
+
+const { host } = options;
+let relay;
+try {
+  relay = await startRelay(options);
+} catch (e) {
+  console.error(`seedrelay: ${e.message}`);
+  process.exit(1);
+}
+const l = { ...DEFAULT_LIMITS, ...options.limits };
+console.log(`seedrelay listening on ws://${bracket(host)}:${relay.port}/v1/`);
+console.log(`  answers to: ${relay.authorities.join(", ")}`);
+console.log(`  origin allowlist: ${options.allowOrigins.length ? options.allowOrigins.slice(0, 4).join(", ") : "localhost pages"}`);
+console.log(`  registration: ${options.secrets.length ? `needs a secret (${options.secrets.length} accepted)` : "open to any key"}`);
+console.log(`  limits: ${l.maxConns} conns, ${l.maxRooms} rooms, ${l.maxPerRoom}/room, ${l.maxPerIp}/ip, ${l.maxPerRoomIp}/ip in a room, ` +
+  `IPv6 by /${l.ipv6Prefix}, registrations ${l.registerRate > 0 ? `${l.registerRate}/s per ip` : "unmetered"}, ` +
+  `splices ${l.spliceRate > 0 ? `${l.spliceRate} KiB/s per ip` : "unmetered"}${options.trustedProxies.length ? " (X-Forwarded-For trusted)" : ""}`);
+for (const port of relay.stunPorts) console.log(`  STUN on udp port ${port}`);
+console.log(`  heartbeat: ${l.heartbeatSecs > 0 ? `${l.heartbeatSecs}s ping/reap` : "disabled"}`);
+if (!isLoopbackHost(host)) console.log(`  ⚠  bound to ${host || "every interface"}: exposed to the network`);
 
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, () => {
-    relay.close();
-    relay.server.close();
-    for (const socket of udp) socket.close();
     // Sockets whose far ends never close hold the process no longer than this.
-    setTimeout(() => process.exit(0), 2000).unref();
+    setTimeout(() => process.exit(0), 3000).unref();
+    void relay.close().then(() => process.exit(0));
   });
 }

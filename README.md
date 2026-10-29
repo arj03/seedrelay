@@ -7,11 +7,15 @@ browser, or anything behind NAT) is reached. Once linked, the nodes move to WebR
 they can, and close the splice behind them. Apps meet each other's keys in **rooms**,
 IRC-style, with the small client in `rooms.mjs`.
 
-The package is **`relay.mjs`**, a bounded WebSocket server (`createRelay`),
-**`server.mjs`**, the bin that runs it, and **`rooms.mjs`**, the room client apps use,
-with no third-party dependencies. A node's side of registration and splices is the
-seedkernel transport bundle, which speaks that wire itself (seedkernel §12.7); rooms are
-the app's, and the transport knows nothing of them.
+**The relay is a signed seedkernel bundle**, **`bundle/relay.skb`** (built from `guest/relay.js`),
+which a seedkernel node runs as its transport: the node's sockets, listeners and UDP ports
+are the relay's, and its code runs confined in the node's realm, with no authority beyond
+them. The native seedkernel binary runs it with no Node at all. The package is that
+bundle, **`relay.mjs`**, which runs it on a seedkernel node in this process
+(`startRelay`), **`server.mjs`**, the bin, and **`rooms.mjs`**, the room client apps use. A
+node's side of registration and splices is the seedkernel transport bundle, which speaks
+that wire itself (seedkernel §12.7); rooms are the app's, and the transport knows nothing
+of them.
 
 The relay is not trusted with traffic. The seedkernel channel handshake runs end to
 end through a splice, so the relay forwards ciphertext it cannot read and cannot pose
@@ -25,14 +29,22 @@ in-process relay. [seedshell](https://github.com/arj03/seedshell) and
 [seedstore](https://github.com/arj03/seedstore) both use it.
 
 **Contents:** [Quick start](#quick-start) · [Running the server](#running-the-server) ·
-[Deploying publicly](#deploying-publicly) · [Joining a room](#joining-a-room) ·
-[What's here](#whats-here) · [Troubleshooting](#troubleshooting)
+[Running natively](#running-natively) · [Deploying publicly](#deploying-publicly) ·
+[Joining a room](#joining-a-room) · [What's here](#whats-here) ·
+[Troubleshooting](#troubleshooting)
 
 ## Quick start
 
 ### Prerequisites
 
-- **Node.js ≥ 20.** There are no runtime dependencies.
+- **Natively:** a seedkernel binary, `relay.skb` and a few lines of settings; no Node. See
+  [Running natively](#running-natively).
+- **On Node:** Node.js ≥ 20 and a built seedkernel checkout beside this one (`npm run
+  build` in `seedkernel/WASM`), which seedrelay depends on through
+  `"seedkernel-wasm": "file:../seedkernel/WASM"` for the host the bin runs. It has no other
+  dependency.
+- **To change the relay:** the same, since `npm run build` signs `relay.skb` with
+  seedkernel's bundle author.
 
 An app that starts the relay from its own scripts depends on seedrelay as a sibling
 checkout through a `file:` dependency (`"seedrelay": "file:../seedrelay"`), so the usual
@@ -49,12 +61,14 @@ some-dir/
 ### Run and test
 
 ```sh
+npm install
 npm run start -- 8080     # → ws://127.0.0.1:8080
 npm test
 ```
 
-When installed as a dependency, the `seedrelay` bin runs the same server, which is
-how seedshell's `npm run relay` starts it:
+The bin runs `relay.skb` on a seedkernel node in its own process. When installed as a
+dependency, the `seedrelay` bin runs the same, which is how seedshell's `npm run relay`
+starts it:
 
 ```sh
 npx seedrelay 8080
@@ -63,7 +77,8 @@ npx seedrelay 8080
 | Script | What it does |
 | --- | --- |
 | `npm run start` | Starts the relay (`node server.mjs`). Arguments after `--` are passed through. |
-| `npm test` | Runs the relay tests with `node --test`. |
+| `npm run build` | Signs `guest/relay.js` into `relay.skb` under `relay.key`, written on the first build. It rewrites `relay.skb` only when the bundle's content changed, since every signature differs. |
+| `npm test` | Runs the relay tests with `node --test`, starting with one that fails while `relay.skb` is behind `guest/relay.js`. |
 
 ## Running the server
 
@@ -97,7 +112,8 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
 | `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters, with no commas or whitespace at either end. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
-| `--stun [HOST:]PORT`, `--stun off` | `RELAY_STUN` | `3478` | Answer STUN Binding requests on this UDP port and the next, on every interface unless a host is named, since UDP does not pass through an HTTP proxy; `off` answers none. Nodes ask a relay's ports `3478` and `3479`; see [STUN](#stun). |
+| `--stun PORT`, `--stun off` | `RELAY_STUN` | `3478` | Answer STUN Binding requests on this UDP port and the next, on every interface, since UDP does not pass through an HTTP proxy; `0` lets the OS pick two, and `off` answers none. Nodes ask a relay's ports `3478` and `3479`; see [STUN](#stun). |
+| `--print-config` | | | Print the settings the other flags make, as the JSON a native node takes with `--transport-config`, and exit. See [Running natively](#running-natively). |
 
 A malformed value (including a whitespace-only number) or an unknown option stops the
 relay at startup, rather than leaving it running with a limit it was not given. An
@@ -144,10 +160,12 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`,
   `"seedkernel-link-scope-v1\0" ‖ "seedkernel-relay-register-v1\0" ‖ authority ‖ nonce`,
   where `authority` is the relay's `Host`, lowercased and without a `:80` or `:443`
   port. The first prefix is the one seedkernel's host puts in front of everything its
-  transport signs. A room socket's signature is over
-  `"seedrelay-rooms-v1\0" ‖ authority ‖ nonce` instead, which the app makes itself; no
-  seedkernel signature starts that way, so neither kind can register the other, and an
-  app's rooms can never draw its node's calls. A socket whose `Host` is not one of the relay's own names
+  transport signs, and checks it under for the relay through `node/verify`. A room
+  socket's signature is over
+  `"seedkernel-link-scope-v1\0" ‖ "seedrelay-rooms-v1\0" ‖ authority ‖ nonce` instead,
+  which the app makes itself with the node's key (`rooms.mjs`); the two tags differ, so
+  neither kind can register the other, and an app's rooms can never draw its node's
+  calls. A socket whose `Host` is not one of the relay's own names
   (`--authority`) is refused with `421` before it gets a nonce: otherwise relay A could
   take a nonce from relay B, have one of its visitors sign it for `a.example`, present
   that to B as `Host: a.example`, and draw the visitor's calls on B. Anything else
@@ -158,8 +176,8 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`,
   kinds of socket, and drops one without it. BLAKE2b cannot be length-extended, so
   hashing the secret in is a MAC with no HMAC around it, and every party already has
   it: Node's `blake2b512`, libsodium's `crypto_generichash(64, m)`, and seedkernel's
-  `crypto/blake2b`. It is unkeyed, since Node has no keyed BLAKE2b, and all 64 bytes:
-  BLAKE2b-256 is another hash, not a shorter one. The secret itself never crosses the
+  `crypto/blake2b`. It is unkeyed, and all 64 bytes: BLAKE2b-256 is another hash, not a
+  shorter one. The secret itself never crosses the
   wire, and since the signature covers the nonce, a MAC a listener sees is no good on
   any other socket or with any other key. A relay without secrets ignores the MAC.
 - **Rooms.** A registered room socket joins rooms by id, up to 16 at once, and leaves
@@ -176,9 +194,9 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`,
   them after 10 seconds.
 - **Splices.** Data frames are streamed through unmasked, whatever their size or
   fragmentation, so the relay holds a chunk, never a whole message. Ping and pong stay on
-  each hop, and a close ends both ends. A full receiver, or a sender past its
-  address's budget, pauses the sender, and a receiver that does not drain for 2 minutes
-  ends the splice.
+  each hop, and a close ends both ends. A receiver holding more than 64 KiB unread pauses
+  its sender until it is down to 16 KiB, as does a sender past its address's budget until
+  the debt is paid, and a receiver that does not drain for 2 minutes ends the splice.
 
 Rooms are not authenticated: **a room id is a bearer credential** for learning which
 keys are in it, and a name is only as private as it is hard to guess. For a private
@@ -267,6 +285,11 @@ to redial). Pairs that move to WebRTC cost the relay
 nothing, so most rooms need far less; a relay that hosts several large rooms of native
 nodes behind NAT should raise `--max-conns` with the process's file limit.
 
+Every socket is served by the one realm the bundle runs in. On a laptop's loopback, the
+native binary carried one splice at 143 MB/s, far above the per-address meter, so the
+meter is what a client of a busy relay feels first. Past what the realm can take, the
+host stops reading sockets rather than dropping them.
+
 ### STUN
 
 WebRTC connects two nodes behind NAT only once each knows the address the internet sees
@@ -279,6 +302,43 @@ forged).
 Two ports, because a node whose two answers name different ports is behind a NAT that
 gives each destination its own port, and its UDP path then takes more than a plain punch.
 With `--stun off`, pairs on different networks mostly stay relayed.
+
+## Running natively
+
+The native seedkernel binary runs `bundle/relay.skb` as its transport, with no Node and
+nothing to build: copy the binary and `relay.skb` to the server, write the settings, and
+start it.
+The binary must come from a seedkernel as new as this relay, whose host the relay relies
+on (`link/pause` among others).
+
+```sh
+cat > relay.json <<'EOF'
+{ "authorities": ["relay.example:8080"] }
+EOF
+seedkernel --transport bundle/relay.skb --listen ws=0.0.0.0:8080 --transport-config relay.json
+```
+
+The settings are the bin's options, as JSON. Every key is optional but `authorities`,
+since the relay cannot know the names nodes dial it by; a key left out keeps the bin's
+default:
+
+| Key | Flag | Value |
+| --- | --- | --- |
+| `authorities` | `--authority` | The `host[:port]` names nodes dial, lowercase, no `:80` or `:443`. |
+| `allowOrigins` | `--allow-origin` | Allowed browser origins, replacing the localhost pages. |
+| `trustedProxies` | `--trusted-proxy` | Proxy IP addresses whose `X-Forwarded-For` is believed. |
+| `secrets` | `--secret` | The secrets a private relay registers clients with. |
+| `stun` | `--stun` | The first of the two STUN ports, `0` for two the OS picks, `null` for none. |
+| `limits` | `--max-conns` and the rest | `{ "maxConns": 2048, "maxRooms": 512, "maxPerRoom": 32, "maxPerIp": 72, "maxPerRoomIp": 16, "ipv6Prefix": 64, "registerRate": 4, "spliceRate": 1024, "heartbeatSecs": 30 }`, any of them. |
+
+Where Node is at hand, `node server.mjs 8080 --authority relay.example:8080 --print-config`
+writes the file from the same flags the bin takes. The node's `--listen` takes the place of
+`--host` and `--port`; every listener speaks HTTP and WebSocket, whatever its label. The
+node also keeps a key and a data directory (`--key`, `--dir`), which the relay does not
+use. Its log lines go to the node's console.
+On a native node the heartbeat and STUN start with the first connection, since nothing
+reaches the bundle before one, and `SIGINT` ends the process at once, without the `1012`
+goodbye.
 
 ## Deploying publicly
 
@@ -452,11 +512,15 @@ with `--relay-secret`.
 
 | Path | What it is |
 | --- | --- |
-| `relay.mjs` | The relay: `createRelay({ authorities, limits, clock, … })`, `stunResponse`, and `parseOptions` for the command line. |
+| `bundle/relay.skb` | The relay bundle, signed: what the bin and a native node run. |
+| `guest/relay.js` | Its source: the bundle's guest program, run by a seedkernel node as its link occupant. It reads its settings from the signed defaults and the operator's `LOCAL`, takes the host's link events (accepted sockets, their bytes, closes, datagrams, the wake), and answers the host-only `start` and `close` on the service id `_relay`. |
+| `relay.mjs` | The Node side: `parseOptions` for the command line, `relayConfig` (the settings the bundle reads) and the signed defaults, and `startRelay`, which runs `relay.skb` on a seedkernel node in this process. |
 | `rooms.mjs` | The room client apps use in the browser and on Node: `roomClient` and `roomId`. |
-| `server.mjs` | The `seedrelay` bin: parses the command line, listens (on UDP too, for STUN), and closes with `1012` on shutdown. The option list is also in its header comment. |
+| `server.mjs` | The `seedrelay` bin: parses the command line, starts the relay, prints what it serves and its log lines, and closes with `1012` on shutdown. The option list is also in its header comment. |
+| `scripts/build.mjs` | Signs `guest/relay.js` into `relay.skb` under `relay.key`, when its content changed; `--check` fails when it would. |
 | `scripts/https-front.mjs` | A TLS front for a server with a certificate and no proxy: serves a page over HTTPS and passes `/v1/` upgrades to the relay. See [Without a reverse proxy](#without-a-reverse-proxy). |
-| `test/relay.test.mjs` | Drives `createRelay` with fake sockets and a fake clock: registration and authorities, rooms and announcements, calls and splices, charging and caps, backpressure, frame validation, origins, proxy trust, options and log redaction; and one run of the bin over real sockets. |
+| `test/harness.mjs` | The guest program in a realm of its own, behind a stand-in for seedkernel's host: links that record what the relay writes, a clock the test moves, and the host calls it makes. |
+| `test/relay.test.mjs` | Drives the guest through the harness: registration and authorities, rooms and announcements, calls and splices, charging and caps, backpressure, frame and HTTP validation, origins, proxy trust, options and log redaction; and runs of the bin over real sockets. |
 
 ## Troubleshooting
 
@@ -477,7 +541,9 @@ with `--relay-secret`.
   reachable interface with `--host`, or better, put it behind a TLS proxy (see
   [Deploying publicly](#deploying-publicly)), or behind `scripts/https-front.mjs` where
   there is none. A page served over HTTPS also needs a `wss://` relay URL.
-- **Startup fails.** An option is malformed or unknown; the relay names it.
+- **Startup fails.** An option is malformed or unknown, and the relay names it; or the
+  STUN ports are taken (`relay: STUN cannot bind UDP port …`), which `--stun` moves; or
+  `seedkernel-wasm` is missing, when the seedkernel checkout beside this one is not built.
 - **The HTTPS front refuses to start as root.** Pass `--user`. If pages 404 after it
   starts, `--root` is not readable by that user.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,

@@ -1,9 +1,9 @@
 {
   "name": "seedrelay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "App-neutral relay for seedkernel nodes: signed registration, rooms and splices.",
+  "description": "App-neutral relay for seedkernel nodes, as a signed seedkernel bundle: signed registration, rooms and splices.",
   "exports": {
     ".": "./relay.mjs",
     "./rooms": "./rooms.mjs"
@@ -12,13 +12,18 @@
     "seedrelay": "./server.mjs"
   },
   "files": [
+    "bundle/relay.skb",
     "relay.mjs",
     "rooms.mjs",
     "server.mjs"
   ],
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test"
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/relay.test.mjs"
+  },
+  "dependencies": {
+    "seedkernel-wasm": "file:../seedkernel/WASM"
   },
   "engines": {
     "node": ">=20"
