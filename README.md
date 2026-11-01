@@ -39,7 +39,7 @@ in-process relay. [seedshell](https://github.com/arj03/seedshell) and
 
 - **Natively:** a seedkernel binary, `relay.skb` and a few lines of settings; no Node. See
   [Running natively](#running-natively).
-- **On Node:** Node.js ≥ 20 and a built seedkernel checkout beside this one (`npm run
+- **On Node:** Node.js ≥ 22 and a built seedkernel checkout beside this one (`npm run
   build` in `seedkernel/WASM`), which seedrelay depends on through
   `"seedkernel-wasm": "file:../seedkernel/WASM"` for the host the bin runs. It has no other
   dependency.

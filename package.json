@@ -26,6 +26,6 @@
     "seedkernel-wasm": "file:../seedkernel/WASM"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }
