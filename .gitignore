@@ -1,2 +1,4 @@
 node_modules/
 relay.key
+seedkernel.key
+data.freshness.json

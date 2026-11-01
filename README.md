@@ -78,7 +78,7 @@ npx seedrelay 8080
 | --- | --- |
 | `npm run start` | Starts the relay (`node server.mjs`). Arguments after `--` are passed through. |
 | `npm run build` | Signs `guest/relay.js` into `relay.skb` under `relay.key`, written on the first build. It rewrites `relay.skb` only when the bundle's content changed, since every signature differs. |
-| `npm test` | Runs the relay tests with `node --test`, starting with one that fails while `relay.skb` is behind `guest/relay.js`. |
+| `npm test` | Runs the relay tests with `node --test`, one of which fails while `relay.skb` is behind `guest/relay.js`. |
 
 ## Running the server
 
@@ -457,6 +457,7 @@ the sockets: a factory that can reach the relay and, for the move to WebRTC,
 seedkernel's `RtcNetwork` for the peer connections.
 
 ```js
+import { bootShell } from "seedkernel-wasm/shell-core";
 import { WsNetwork } from "seedkernel-wasm/net-ws";
 import { RtcNetwork } from "seedkernel-wasm/net-rtc";
 import { combineChannels } from "seedkernel-wasm/socket-seam";
@@ -464,7 +465,7 @@ import { OpArgs } from "seedkernel-wasm/op-frame";
 import { roomClient } from "seedrelay/rooms";
 
 const relay = "wss://relay.example";
-const { shell } = await bootShell({ /* … */ transport: { channels: combineChannels(new WsNetwork(), new RtcNetwork()) } });
+const { shell } = await bootShell({ /* … */ services: { transport: { channels: combineChannels(new WsNetwork(), new RtcNetwork()) } } });
 await shell.call("_net", new OpArgs("relay").text(relay).build());
 const mates = new Set();
 const rooms = roomClient({
@@ -481,9 +482,8 @@ await rooms.join("my-room");
 A room has no secret: joining one is agreeing to be reached by everyone in it, and an
 app may be in several at once. The app tells the transport who its room-mates are with
 `welcome`, the whole set each time, and a call one of them places is answered whether or
-not this node has a contact secret. A room-mate is called with 32 zero bytes for a
-secret; an empty blob would make the transport present this node's own instead. A
-node's contact secret then gates only a caller it shares no room with, who needs it in
+not this node has a contact secret. A room-mate is called with no secret, an empty blob
+or 32 zero bytes. A node's contact secret then gates only a caller it shares no room with, who needs it in
 its own `addr` for this node. An app in several rooms welcomes the keys of all of them.
 
 The transport redials a relay that drops, and its `relayState` operation reports
