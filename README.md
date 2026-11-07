@@ -1,21 +1,24 @@
 # seedrelay: a relay for [seedkernel](https://github.com/arj03/seedkernel)
 
-The app-neutral relay for seedkernel nodes. A node **registers** its key here by signing
-a challenge, and reaches any registered key through a **splice**: two sockets the relay
-joins, forwarding what one sends to the other. That is how a node nobody can dial (a
+The app-neutral relay for seedkernel nodes. A node holds one **relay link** here, a
+seedkernel channel with the relay as its responder, pinned to the relay's key, so its
+key, its calls and its rooms travel in records and nothing on the path names a key. The
+link is its **registration**, and over it the node reaches any registered key through a
+**splice**: two sockets the relay joins, forwarding what one sends to the other. That is how a node nobody can dial (a
 browser, or anything behind NAT) is reached. Once linked, the nodes move to WebRTC where
 they can, and close the splice behind them. Apps meet each other's keys in **rooms**,
-IRC-style, with the small client in `rooms.mjs`.
+IRC-style, with the small client in `rooms.mjs`, on that same link.
 
 **The relay is a signed seedkernel bundle**, **`bundle/relay.skb`** (built from `guest/relay.js`),
 which a seedkernel node runs as its transport: the node's sockets, listeners and UDP ports
 are the relay's, and its code runs confined in the node's realm, with no authority beyond
 them. The native seedkernel binary runs it with no Node at all. The package is that
 bundle, **`relay.mjs`**, which runs it on a seedkernel node in this process
-(`startRelay`), **`server.mjs`**, the bin, and **`rooms.mjs`**, the room client apps use. A
-node's side of registration and splices is the seedkernel transport bundle, which speaks
-that wire itself (seedkernel §12.7); rooms are the app's, and the transport knows nothing
-of them.
+(`startRelay`), **`server.mjs`**, the bin, and **`rooms.mjs`**, the room client apps use. The
+bundle answers each relay link with seedkernel's own channel code, which its build puts in
+front of `guest/relay.js`. A node's side of the relay link and splices is the seedkernel
+transport bundle (seedkernel §12.7); rooms are the app's, which the transport carries to
+the relay unread and knows nothing of.
 
 The relay is not trusted with traffic. The seedkernel channel handshake runs end to
 end through a splice, so the relay forwards ciphertext it cannot read and cannot pose
@@ -62,7 +65,7 @@ some-dir/
 
 ```sh
 npm install
-npm run start -- 8080     # → ws://127.0.0.1:8080
+npm run start -- 8080     # → ws://<relay key>.<secret>@127.0.0.1:8080
 npm test
 ```
 
@@ -77,7 +80,7 @@ npx seedrelay 8080
 | Script | What it does |
 | --- | --- |
 | `npm run start` | Starts the relay (`node server.mjs`). Arguments after `--` are passed through. |
-| `npm run build` | Signs `guest/relay.js` into `relay.skb` under `relay.key`, written on the first build. It rewrites `relay.skb` only when the bundle's content changed, since every signature differs. |
+| `npm run build` | Signs seedkernel's channel and `guest/relay.js` into `relay.skb` under `relay.key`, written on the first build. It rewrites `relay.skb` only when the bundle's content changed, since every signature differs. |
 | `npm test` | Runs the relay tests with `node --test`, one of which fails while `relay.skb` is behind `guest/relay.js`. |
 
 ## Running the server
@@ -99,7 +102,6 @@ Environment variables seed the defaults; the matching flag overrides them.
 | --- | --- | --- | --- |
 | `--host HOST` | | `127.0.0.1` | Interface to bind. |
 | `--port N` | | `8080` | Port to listen on (a bare number works too). |
-| `--authority NAME` | `RELAY_AUTHORITIES` | the bound address's names | A `host[:port]` nodes dial this relay by, which registrations are signed for. Repeatable; the variable is comma-separated. See [The wire](#the-wire). |
 | `--allow-origin ORIGIN` | | localhost pages | Allowed browser `Origin`. Repeatable; see [Origins](#origins). |
 | `--max-conns N` | `RELAY_MAX_CONNS` | `2048` | Concurrent sockets across the relay, including those still awaiting upgrade. Splice sockets may take 7/8 of them. |
 | `--max-rooms N` | `RELAY_MAX_ROOMS` | `512` | Concurrent rooms. |
@@ -107,32 +109,26 @@ Environment variables seed the defaults; the matching flag overrides them.
 | `--max-per-ip N` | `RELAY_MAX_PER_IP` | `72` | Sockets charged to one client address: its own, and both ends of every splice it called. |
 | `--max-per-room-ip N` | `RELAY_MAX_PER_ROOM_IP` | `16` | Registered sockets one client address may hold in one room. |
 | `--ipv6-prefix N` | `RELAY_IPV6_PREFIX` | `64` | How many leading bits of an IPv6 address name one client, for every per-address limit. |
-| `--register-rate N` | `RELAY_REGISTER_RATE` | `4` | Control and room sockets one client address may open per second, with two seconds of burst, and rooms it may join per second, with 32 at once; `0` leaves both unmetered. |
+| `--register-rate N` | `RELAY_REGISTER_RATE` | `4` | Relay links one client address may open per second, with two seconds of burst, and rooms it may join per second, with 32 at once; `0` leaves both unmetered. |
 | `--splice-rate N` | `RELAY_SPLICE_RATE` | `1024` | KiB/s one client address may send through its splices; `0` leaves them unmetered. |
 | `--heartbeat-secs N` | `RELAY_HEARTBEAT_SECS` | `30` | Ping interval; a socket that misses a pong is reaped. `0` disables it. |
 | `--trusted-proxy IP` | `RELAY_TRUSTED_PROXIES` | none | Trust `X-Forwarded-For` from this proxy address. Repeatable; the variable is comma-separated. See [Deploying publicly](#deploying-publicly). |
-| `--secret SECRET` | `RELAY_SECRETS` | none | Register only nodes and apps that know this secret, of at least 16 characters, with no commas or whitespace at either end. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private relays](#private-relays). |
+| `--secret SECRET` | `RELAY_SECRETS` | the key's own | The contact secret a node must hold, 32 bytes in hex, in place of the one the relay derives from its key. Repeatable, so a new one can be rolled out before the old is dropped; the variable is comma-separated, and keeps secrets out of the process list. See [Private by default](#private-by-default). |
+| `--open` | | off | Take any node, with no secret. An open relay is in public; see [Private by default](#private-by-default). |
+| `--key FILE` | | none | Keep the relay's identity in `FILE`, a hex seed written on the first start. A relay link is pinned to the relay's key, and its secret is derived from it, both of which its URL carries, so without it the URL is new each run. |
 | `--stun PORT`, `--stun off` | `RELAY_STUN` | `3478` | Answer STUN Binding requests on this UDP port and the next, on every interface, since UDP does not pass through an HTTP proxy; `0` lets the OS pick two, and `off` answers none. Nodes ask a relay's ports `3478` and `3479`; see [STUN](#stun). |
 | `--print-config` | | | Print the settings the other flags make, as the JSON a native node takes with `--transport-config`, and exit. See [Running natively](#running-natively). |
 
 A malformed value (including a whitespace-only number) or an unknown option stops the
 relay at startup, rather than leaving it running with a limit it was not given. An
 explicitly set `RELAY_SECRETS` must name at least one secret, or a `--secret` flag must
-supply one; leave it unset for an open relay.
-
-Without `--authority`, a relay bound to a loopback address answers to `localhost`,
-`127.0.0.1` and `[::1]` at its port, and one bound to any other address to that
-address. A relay bound to every interface — `0.0.0.0`, `::`, any other spelling of the
-unspecified address, or an empty `--host` — has no name of its own and will not start
-without `--authority`, and neither does a relay nodes reach by any other name, such as a
-public one behind a proxy.
+supply one; leave it unset for the relay's own. `--open` takes no secret.
 
 ### Sockets
 
 | Path | Socket |
 | --- | --- |
-| `/v1/` | A control socket: a node's transport registers its key, and places and takes calls |
-| `/v1/rooms` | A room socket: an app registers its key, and joins and leaves rooms |
+| `/v1/` | A relay link: a node's transport registers its key, places and takes calls, and joins rooms |
 | `/v1/?splice=<32 hex>` | One end of a splice, named by the ticket a call gave it |
 
 The first segment names the wire version. Any other path is refused with `404`, so a
@@ -141,52 +137,48 @@ was given is refused with `404`, and a second socket for one ticket with `409`.
 
 ### The wire
 
-Both kinds of socket carry binary frames whose first byte is the type. Keys are 32-byte
-seedkernel identities, rooms 32-byte ids, tickets 16 random bytes chosen by the caller.
-Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`, or
-`[pk 32][sig 64][mac 64]` on a relay with a secret, and `0x01` registered; then:
+A relay link runs seedkernel's channel handshake first (seedkernel's TRANSPORT.md,
+Handshake), the node its initiator and the relay its responder, on the public network's
+root, each message one binary WebSocket frame. The relay's key is what the node pins it
+to and its contact secret what msg1 opens under, so a relay's address is
+`ws://<key>.<secret>@host:port`, as the bin prints it, or `ws://<key>@host:port` for an
+open relay. Then every
+frame is a record, `[type u8][body]` inside it. Keys are 32-byte seedkernel identities,
+rooms 32-byte ids, tickets 16 random bytes chosen by the caller.
 
-| Socket | Relay → client | | Client → relay | |
-| --- | --- | --- | --- | --- |
-| control | `0x05` incoming | `[from 32][ticket 16]` | `0x05` call | `[to 32][ticket 16]` |
-| control | `0x06` unreachable | `[to 32][ticket 16]` | | |
-| rooms | `0x02` members | `[room 32][pk 32]*` | `0x02` join | `[room 32]` |
-| rooms | `0x03` joined | `[room 32][pk 32]` | `0x03` leave | `[room 32]` |
-| rooms | `0x04` left | `[room 32][pk 32]` | | |
-| rooms | `0x07` refused | `[room 32]` | | |
+| Relay → node | | Node → relay | |
+| --- | --- | --- | --- |
+| `0x01` registered | | `0x05` call | `[to 32][ticket 16]` |
+| `0x05` incoming | `[from 32][ticket 16]` | `0x08` tell | `[message]` |
+| `0x06` unreachable | `[to 32][ticket 16]` | | |
+| `0x08` tell | `[message]` | | |
 
-- **Registration.** The relay sends a nonce on upgrade, and the node must answer within
-  10 seconds with its key and an Ed25519 signature over
-  `"seedkernel-link-scope-v1\0" ‖ "seedkernel-relay-register-v1\0" ‖ authority ‖ nonce`,
-  where `authority` is the relay's `Host`, lowercased and without a `:80` or `:443`
-  port. The first prefix is the one seedkernel's host puts in front of everything its
-  transport signs, and checks it under for the relay through `node/verify`. A room
-  socket's signature is over
-  `"seedkernel-link-scope-v1\0" ‖ "seedrelay-rooms-v1\0" ‖ authority ‖ nonce` instead,
-  which the app makes itself with the node's key (`rooms.mjs`); the two tags differ, so
-  neither kind can register the other, and an app's rooms can never draw its node's
-  calls. A socket whose `Host` is not one of the relay's own names
-  (`--authority`) is refused with `421` before it gets a nonce: otherwise relay A could
-  take a nonce from relay B, have one of its visitors sign it for `a.example`, present
-  that to B as `Host: a.example`, and draw the visitor's calls on B. Anything else
-  before registering, or a bad signature, drops the socket. Calls for a key go to the
-  control socket that registered it most recently.
-- **Secrets.** A relay started with `--secret` also wants the MAC
-  `BLAKE2b-512("seedrelay-secret-v1\0" ‖ pk ‖ sig ‖ secret)` after the signature, on both
-  kinds of socket, and drops one without it. BLAKE2b cannot be length-extended, so
-  hashing the secret in is a MAC with no HMAC around it, and every party already has
-  it: Node's `blake2b512`, libsodium's `crypto_generichash(64, m)`, and seedkernel's
-  `crypto/blake2b`. It is unkeyed, and all 64 bytes: BLAKE2b-256 is another hash, not a
-  shorter one. The secret itself never crosses the
-  wire, and since the signature covers the nonce, a MAC a listener sees is no good on
-  any other socket or with any other key. A relay without secrets ignores the MAC.
-- **Rooms.** A registered room socket joins rooms by id, up to 16 at once, and leaves
+A tell carries rooms, which a node's transport passes between the relay and its host
+unread (its `tell` operation and status). Their messages:
+
+| Relay → node | | Node → relay | |
+| --- | --- | --- | --- |
+| `0x02` members | `[room 32][pk 32]*` | `0x02` join | `[room 32]` |
+| `0x03` joined | `[room 32][pk 32]` | `0x03` leave | `[room 32]` |
+| `0x04` left | `[room 32][pk 32]` | | |
+| `0x07` refused | `[room 32]` | | |
+
+- **Registration.** msg3 proves the node's key, and that is its registration: the relay
+  says `registered` and routes calls for the key to the link that proved it most
+  recently. A msg1 that does not open under the relay's contact secret (none for an open
+  relay) draws silence until the handshake deadline, 10 seconds after the upgrade, as any
+  seedkernel accept does. A record the wire has no use for, or one that does not open,
+  drops the link.
+- **Secrets.** Every relay has a contact secret unless it is opened: a node presents it
+  at msg1 as a dial presents a peer's, so it never crosses the wire and nothing a listener
+  sees can be tested against it.
+- **Rooms.** A registered link joins rooms by id, up to 16 at once, and leaves
   them, as IRC's `/join` and `/part` do. `rooms.mjs` makes a room's id by hashing its
   name, SHA-256 of `"seedrelay-room-v1\0" ‖ name`, so the relay never learns names. A join gets the room's other keys
-  in one `members` frame, then `joined` and `left` as keys come and go. Two sockets with one key are one member. A join the room has no seat for (see
-  [Limits](#limits)) is answered `refused`, and the socket stays registered. A room
+  in one `members` message, then `joined` and `left` as keys come and go. Two links with one key are one member. A join the room has no seat for (see
+  [Limits](#limits)) is answered `refused`, and the link stays registered. A room
   exists for as long as anyone is in it.
-- **Calls.** `call` sends `incoming` to the callee's socket only, with a ticket of the
+- **Calls.** `call` sends `incoming` to the callee's link only, with a ticket of the
   relay's own rather than the caller's, or answers `unreachable` when the key is not
   registered here, is the caller's own, the ticket is in use, or the caller's address
   has too many calls waiting (see [Limits](#limits)). Each end then opens
@@ -200,10 +192,10 @@ Both open with `0x00` challenge `[nonce 32]`, `0x01` register `[pk 32][sig 64]`,
 
 Rooms are not authenticated: **a room id is a bearer credential** for learning which
 keys are in it, and a name is only as private as it is hard to guess. For a private
-room, use at least 16 random bytes encoded as hex. Room ids travel inside the WebSocket,
-never in a URL, so no proxy access log holds them, and the relay never logs them, nor
-keys or request paths. Reaching a key needs no room at all, and the
-callee's contact secret is what gates it.
+room, use at least 16 random bytes encoded as hex. Room ids travel inside the relay
+link's records, never in a URL, so no proxy access log or listener holds them, and the
+relay never logs them, nor keys or request paths. Reaching a key needs no room at all,
+and the callee's contact secret is what gates it.
 
 ### Origins
 
@@ -229,17 +221,17 @@ when that access is intended. Native clients that send no `Origin` header, such 
 
 ### Limits
 
-Control and room sockets carry a few small frames each; splices carry the traffic.
+Relay links carry a handshake and a few small records each; splices carry the traffic.
 
-- **Control frames** on control and room sockets are binary and capped at 256 bytes; the largest, a
-  registration, is 97, or 161 with a secret's MAC. Text, fragmented frames and WebSocket extensions are
-  unsupported. Both kinds of socket read frames with one parser and the same rules,
-  lengths in their shortest encoding included.
-- **Backlog.** Every write to a control or room socket, including ping/pong, respects a 256 KiB
+- **Frames** on a relay link are binary and capped at 2 KiB; the largest, msg1, is
+  1,233 bytes. Text, fragmented frames and WebSocket extensions are unsupported. Relay
+  links and splices read frames with one parser and the same rules, lengths in their
+  shortest encoding included.
+- **Backlog.** Every write to a relay link, including ping/pong, respects a 256 KiB
   per-socket backlog cap; slow readers are disconnected. Splices use backpressure
   instead.
 - **Handshakes** must complete within 10 seconds of the TCP connection, however
-  slowly the input trickles in, and registration within 10 seconds of the upgrade.
+  slowly the input trickles in, and the channel handshake within 10 seconds of the upgrade.
 - **Calls** are charged to the caller's address, not to a table everyone shares: it may
   have as many waiting as a room has seats (`--max-per-room`), and at most 8 splices to
   any one key, waiting or joined, since each makes the callee open a socket and run a
@@ -255,9 +247,9 @@ Control and room sockets carry a few small frames each; splices carry the traffi
   no seat.
 - **Addresses.** An IPv6 client is accounted by its `/64` (`--ipv6-prefix`), since one
   host is routinely handed a whole `/64`. One address opens at most `--register-rate`
-  control and room sockets a second (default 4, with two seconds of burst), and joins
+  relay links a second (default 4, with two seconds of burst), and joins
   rooms at the same rate, with 32 at once, so an app redialing joins all its rooms again.
-- **Traffic** on control sockets is metered by token buckets with two seconds of burst
+- **Traffic** on relay links is metered by token buckets with two seconds of burst
   allowance. What a room announces is bounded by the join rate, however a socket leaves
   and joins again: a joiner is never turned away for what announcing it costs.
 
@@ -277,10 +269,9 @@ availability against a distributed denial of service.
 
 Every room member links to every other, and a pair that cannot move to a direct link
 stays on a splice of two sockets. A room of N members that all stay relayed costs
-N(N−1) splice sockets plus N control and N room sockets, and its smallest key, which
-calls the rest, is charged 2(N−1) + 2 of them against its address, its app's room
-socket included. The defaults fit one such room at `--max-per-room` (32 members: 992
-splice sockets of the 1,792 splices may hold, and 64 of an address's 72, leaving room
+N(N−1) splice sockets plus N relay links, and its smallest key, which calls the rest,
+is charged 2(N−1) + 1 of them against its address, its own relay link included. The defaults fit one such room at `--max-per-room` (32 members: 992
+splice sockets of the 1,792 splices may hold, and 63 of an address's 72, leaving room
 to redial). Pairs that move to WebRTC cost the relay
 nothing, so most rooms need far less; a relay that hosts several large rooms of native
 nodes behind NAT should raise `--max-conns` with the process's file limit.
@@ -313,29 +304,28 @@ on (`link/pause` among others).
 
 ```sh
 cat > relay.json <<'EOF'
-{ "authorities": ["relay.example:8080"] }
+{ "trustedProxies": [] }
 EOF
-seedkernel --transport bundle/relay.skb --listen ws=0.0.0.0:8080 --transport-config relay.json
+seedkernel --transport bundle/relay.skb --key relay-id.key --listen ws=0.0.0.0:8080 --transport-config relay.json
 ```
 
-The settings are the bin's options, as JSON. Every key is optional but `authorities`,
-since the relay cannot know the names nodes dial it by; a key left out keeps the bin's
-default:
+The settings are the bin's options, as JSON. Every key is optional; a key left out keeps
+the bin's default:
 
 | Key | Flag | Value |
 | --- | --- | --- |
-| `authorities` | `--authority` | The `host[:port]` names nodes dial, lowercase, no `:80` or `:443`. |
 | `allowOrigins` | `--allow-origin` | Allowed browser origins, replacing the localhost pages. |
 | `trustedProxies` | `--trusted-proxy` | Proxy IP addresses whose `X-Forwarded-For` is believed. |
-| `secrets` | `--secret` | The secrets a private relay registers clients with. |
+| `secrets` | `--secret` | The contact secrets, in hex, the relay registers nodes with, in place of its key's own. |
+| `open` | `--open` | `true` for a relay that takes any node, with no secret. |
 | `stun` | `--stun` | The first of the two STUN ports, `0` for two the OS picks, `null` for none. |
 | `limits` | `--max-conns` and the rest | `{ "maxConns": 2048, "maxRooms": 512, "maxPerRoom": 32, "maxPerIp": 72, "maxPerRoomIp": 16, "ipv6Prefix": 64, "registerRate": 4, "spliceRate": 1024, "heartbeatSecs": 30 }`, any of them. |
 
-Where Node is at hand, `node server.mjs 8080 --authority relay.example:8080 --print-config`
+Where Node is at hand, `node server.mjs 8080 --trusted-proxy 127.0.0.1 --print-config`
 writes the file from the same flags the bin takes. The node's `--listen` takes the place of
 `--host` and `--port`; every listener speaks HTTP and WebSocket, whatever its label. The
-node also keeps a key and a data directory (`--key`, `--dir`), which the relay does not
-use. Its log lines go to the node's console.
+node's key (`--key`) is the relay's identity, the key its URL names, so keep that file;
+it also keeps a data directory (`--dir`), which the relay does not use. Its log lines go to the node's console.
 On a native node the heartbeat and STUN start with the first connection, since nothing
 reaches the bundle before one, and `SIGINT` ends the process at once, without the `1012`
 goodbye.
@@ -346,11 +336,12 @@ Terminate TLS at a reverse proxy, point clients at `wss://` URLs, and keep the r
 bound to loopback behind it:
 
 ```sh
-seedrelay 8080 --authority relay.example --trusted-proxy 127.0.0.1 --allow-origin https://app.example
+seedrelay 8080 --key relay-id.key --trusted-proxy 127.0.0.1 --allow-origin https://app.example
 ```
 
-`--authority` names the relay as nodes dial it: they sign that name, and the relay
-accepts no other. Give each name nodes use, one flag apiece.
+`--key` keeps the relay's identity across restarts, and with it the address nodes are
+given, `wss://<relay key>.<secret>@relay.example`. The relay answers to whatever name a node dials
+it by: the key, not the name, is what a node's relay link is pinned to.
 
 Name each trusted proxy by its actual IP with `--trusted-proxy` or
 `RELAY_TRUSTED_PROXIES`. The proxy must append the real client address to
@@ -375,7 +366,7 @@ peers by key, joining no room, instead.
 STUN on every interface even when it is bound to loopback behind one:
 
 ```sh
-seedrelay 8080 --authority relay.example --trusted-proxy 127.0.0.1
+seedrelay 8080 --key relay-id.key --trusted-proxy 127.0.0.1
 ```
 
 Connection accounting starts at the TCP level, before HTTP headers arrive. Direct
@@ -396,11 +387,11 @@ sudo node scripts/https-front.mjs --cert /etc/letsencrypt/live/relay.example/ful
   --root ../seedshell/browser --index shell.html \
   --user www-data
 
-seedrelay 8080 --authority relay.example:8443 --trusted-proxy 127.0.0.1 \
+seedrelay 8080 --key relay-id.key --trusted-proxy 127.0.0.1 \
   --allow-origin https://relay.example:8443
 ```
 
-Then `https://relay.example:8443/` is the page and `wss://relay.example:8443` the relay,
+Then `https://relay.example:8443/` is the page and `wss://<relay key>.<secret>@relay.example:8443` the relay,
 which is where a seedshell page served over HTTPS looks for it. Open TCP 8443 and UDP 3478 and 3479.
 
 The front listens on `8443` unless given `--port`, serves `--root` with `index.html` at
@@ -412,49 +403,60 @@ that user's primary group), so `--root` must be readable by that user. Started a
 without `--user`, it refuses. Started as anyone else, it stays who it is: `--user` may name
 only that user, and `--group` none. It holds at most 256 sockets and gives a client 10 seconds for its headers and 60
 for its request, since the relay sees a client only once its headers are in. To the relay
-it is a proxy like any other: the authority carries the front's port, since it is not a
-default one, and the page's origin does too.
+it is a proxy like any other, and the page's origin carries the front's port.
 
 To also take console nodes on plain `ws://`, and a page still under development on
-`localhost`, bind the relay publicly and name those as well, since `--allow-origin`
+`localhost`, bind the relay publicly and allow that page as well, since `--allow-origin`
 replaces the localhost defaults:
 
 ```sh
-seedrelay 8080 --host 0.0.0.0 --authority relay.example:8080 --authority relay.example:8443 \
+seedrelay 8080 --host 0.0.0.0 --key relay-id.key \
   --trusted-proxy 127.0.0.1 --allow-origin https://relay.example:8443 \
   --allow-origin http://localhost:3000
 ```
 
-### Private relays
+### Private by default
 
-An open relay registers any key, so anyone who can reach it can splice two keys of
-their own and use it as a pipe, slowed only by the per-address limits. To serve only
-your own nodes and apps, start it with a secret and give them the same one:
+A relay serves only nodes that hold its contact secret. Unless it is given one, it
+derives its own from its key, a hash of its signature over a fixed tag that only the key's
+holder can compute, and prints its URL with both at start:
 
-```sh
-openssl rand -hex 16 > relay.secret    # once; hand the same file's contents to clients
-RELAY_SECRETS=$(cat relay.secret) seedrelay 8080 --authority relay.example --trusted-proxy 127.0.0.1
+```
+seedrelay listening on ws://<relay key>.<secret>@127.0.0.1:8080
 ```
 
-Control and room sockets must then prove the secret when they register; splice
-sockets need only their tickets, which only registered sockets are handed. The proof is
-a MAC, so the secret stays private even over plain `ws://`. A listener who saw one
-registration can still test guesses at the secret offline, though, so use a random
-one, as above, not a password. To change it, start the relay with both old and new,
-move the clients over, then drop the old. Clients take it as
-[Joining a room](#joining-a-room) shows. A seedkernel node proves its secret only to the
-relay it was given for, never to another relay it calls a peer through, so no other
-relay can test guesses at it.
+With `--key` the key, and so the secret and the URL, survive restarts. Hand the URL to
+your nodes. Anyone without it draws silence, so it cannot register, call through the
+relay, join a room or ask whether a key is here. Splice sockets need only their tickets,
+which only registered links are handed. The secret is mixed into the handshake, so it
+never crosses the wire, and nothing a listener sees can be tested against it.
+
+`--secret` names the secret instead, which is how one is rotated without a new key: start
+the relay with both old and new, move the clients over, then drop the old.
+
+```sh
+openssl rand -hex 32 > relay.secret
+RELAY_SECRETS=$(cat relay.secret) seedrelay 8080 --key relay-id.key --trusted-proxy 127.0.0.1
+```
+
+`--open` takes any node, with no secret. **An open relay is in public**, and choosing it is
+choosing that: anyone who can reach it can register, splice two keys of their own and use
+it as a pipe (slowed only by the per-address limits), ask whether any key is online on it,
+and make it do a handshake's public-key work for every msg1 it sends, a connection storm
+that many sources can scale. Open a relay that is meant to be a public service, and
+nothing else. Clients take the URL as [Joining a room](#joining-a-room) shows.
 
 ## Joining a room
 
 A seedkernel node registers on the relay through its transport bundle's host-only
-`relay` operation; the transport opens the control socket itself, and reaches any peer
-it is given as `<pk>@relay+wss://relay.example:443` (seedkernel §12.6, §12.7). Meeting
-peers is the app's: `rooms.mjs` joins rooms on a room socket, and the app hands each
-member it hears to the transport with its `addr` operation. An embedder supplies only
-the sockets: a factory that can reach the relay and, for the move to WebRTC,
-seedkernel's `RtcNetwork` for the peer connections.
+`relay` operation, with the relay's address as the bin prints it; the transport opens the
+relay link itself, and reaches any peer it is given as
+`<pk>.<secret>@relay+wss://<relay key>.<relay secret>@relay.example:443` (seedkernel §12.6, §12.7). Meeting peers is
+the app's: `rooms.mjs` joins rooms through the transport's `tell` operation, reads what
+the relay says from the transport's status, and the app hands each member it hears to the
+transport with its `addr` operation. An embedder supplies only the sockets: a factory
+that can reach the relay and, for the move to WebRTC, seedkernel's `RtcNetwork` for the
+peer connections.
 
 ```js
 import { bootShell } from "seedkernel-wasm/shell-core";
@@ -462,47 +464,49 @@ import { WsNetwork } from "seedkernel-wasm/net-ws";
 import { RtcNetwork } from "seedkernel-wasm/net-rtc";
 import { combineChannels } from "seedkernel-wasm/socket-seam";
 import { OpArgs } from "seedkernel-wasm/op-frame";
-import { roomClient } from "seedrelay/rooms";
+import { roomClient, roomSecret } from "seedrelay/rooms";
 
-const relay = "wss://relay.example";
-const { shell } = await bootShell({ /* … */ services: { transport: { channels: combineChannels(new WsNetwork(), new RtcNetwork()) } } });
-await shell.call("_net", new OpArgs("relay").text(relay).build());
-const mates = new Set();
-const rooms = roomClient({
-  relay, publicKey, sign: (m) => sodium.crypto_sign_detached(m, privateKey),
+const relay = "wss://<relay key>.<secret>@relay.example";
+let rooms = null;
+const { shell } = await bootShell({ /* … */ services: { transport: {
+  channels: combineChannels(new WsNetwork(), new RtcNetwork()),
+  onStatus: (status) => rooms?.status(status),
+} } });
+const net = (op) => shell.call("_net", op.build());
+const secret = await roomSecret("my-room");
+await net(new OpArgs("secrets").blob(secret));
+rooms = roomClient({
+  tell: async (bytes) => (await net(new OpArgs("tell").blob(bytes)))[0] === 1,
   onMember: (room, key, present) => {
-    if (present) mates.add(key); else mates.delete(key);
-    shell.call("_net", new OpArgs("welcome").blob(fromHex([...mates].join(""))).build());
-    if (present) shell.call("_net", new OpArgs("addr").blob(fromHex(key)).blob(new Uint8Array(32)).text(`relay+${relay}`).build());
+    if (present) net(new OpArgs("addr").blob(fromHex(key)).blob(secret).text(`relay+${relay}`));
   },
 });
+await net(new OpArgs("relay").text(relay));
 await rooms.join("my-room");
 ```
 
-A room has no secret: joining one is agreeing to be reached by everyone in it, and an
-app may be in several at once. The app tells the transport who its room-mates are with
-`welcome`, the whole set each time, and a call one of them places is answered whether or
-not this node has a contact secret. A room-mate is called with no secret, an empty blob
-or 32 zero bytes. A node's contact secret then gates only a caller it shares no room with, who needs it in
-its own `addr` for this node. An app in several rooms welcomes the keys of all of them.
+A room's secret (`roomSecret`) is derived from its name under a tag of its own, so the
+relay, which sees only the room's id, cannot derive it, and everyone who knows the name
+holds it. Joining a room is agreeing to be reached by everyone in it: the app hands the
+transport the secrets of the rooms it is in with `secrets`, the whole list each time, and
+a msg1 sealed under any of them is answered as one under the contact secret would be. It
+calls a room-mate under that room's secret. The contact secret then gates only a caller
+the node shares no room with. Nothing here trusts what the relay says a caller is, so a
+relay cannot read which keys a node would answer. A room with a guessable name is a public
+room, and its secret gates nothing.
 
-The transport redials a relay that drops, and its `relayState` operation reports
-whether it is registered; the room client redials its own socket and joins its rooms
-again, and who was in them stays as last heard meanwhile. Linking is the app's too: a
-send dials, and the transport's `ready` operation dials every peer it has been given.
-Its `forget` operation drops one peer, for a room the app leaves.
+The transport redials a relay that drops, and its status says whether it is registered;
+the room client joins its rooms again each time it is, and who was in them stays as last
+heard meanwhile. Linking is the app's too: a send dials, and the transport's `ready`
+operation dials every peer it has been given. Its `forget` operation drops one peer, for
+a room the app leaves.
 
-On a [private relay](#private-relays), pass the relay's secret to both. The transport's
-`relay` operation takes it as a second text after the URL, and `roomClient` takes it with
-the BLAKE2b that browsers lack, from the libsodium the app already signs with:
+The relay's contact secret travels in its URL as it prints it,
+`wss://<relay key>.<secret>@relay.example`, or as a second text after one without it,
+which keeps it out of addresses the app hands around:
 
 ```js
-await shell.call("_net", new OpArgs("relay").text(relay).text(secret).build());
-const rooms = roomClient({
-  relay, publicKey, sign: (m) => sodium.crypto_sign_detached(m, privateKey),
-  secret, blake2b: (m) => sodium.crypto_generichash(64, m),
-  onMember: /* … */,
-});
+await net(new OpArgs("relay").text(relay).text(secret));
 ```
 
 A node run from seedkernel's command line names a file holding the secret instead,
@@ -515,12 +519,13 @@ with `--relay-secret`.
 | `bundle/relay.skb` | The relay bundle, signed: what the bin and a native node run. |
 | `guest/relay.js` | Its source: the bundle's guest program, run by a seedkernel node as its link occupant. It reads its settings from the signed defaults and the operator's `LOCAL`, takes the host's link events (accepted sockets, their bytes, closes, datagrams, the wake), and answers the host-only `start` and `close` on the service id `_relay`. |
 | `relay.mjs` | The Node side: `parseOptions` for the command line, `relayConfig` (the settings the bundle reads) and the signed defaults, and `startRelay`, which runs `relay.skb` on a seedkernel node in this process. |
-| `rooms.mjs` | The room client apps use in the browser and on Node: `roomClient` and `roomId`. |
+| `rooms.mjs` | The room client apps use in the browser and on Node, over the node's transport: `roomClient` and `roomId`. |
 | `server.mjs` | The `seedrelay` bin: parses the command line, starts the relay, prints what it serves and its log lines, and closes with `1012` on shutdown. The option list is also in its header comment. |
-| `scripts/build.mjs` | Signs `guest/relay.js` into `relay.skb` under `relay.key`, when its content changed; `--check` fails when it would. |
+| `scripts/build.mjs` | Signs seedkernel's channel and `guest/relay.js` into `relay.skb` under `relay.key`, when its content changed; `--check` fails when it would. |
 | `scripts/https-front.mjs` | A TLS front for a server with a certificate and no proxy: serves a page over HTTPS and passes `/v1/` upgrades to the relay. See [Without a reverse proxy](#without-a-reverse-proxy). |
 | `test/harness.mjs` | The guest program in a realm of its own, behind a stand-in for seedkernel's host: links that record what the relay writes, a clock the test moves, and the host calls it makes. |
-| `test/relay.test.mjs` | Drives the guest through the harness: registration and authorities, rooms and announcements, calls and splices, charging and caps, backpressure, frame and HTTP validation, origins, proxy trust, options and log redaction; and runs of the bin over real sockets. |
+| `test/channel.mjs` | A node's side of a relay link as the tests speak it: the channel handshake as its initiator and records, written out from libsodium and the ML-KEM module. |
+| `test/relay.test.mjs` | Drives the guest through the harness: the relay link's handshake and secrets, rooms and announcements, calls and splices, charging and caps, backpressure, frame and HTTP validation, origins, proxy trust, options and log redaction; and runs of the bin over real sockets, with seedkernel nodes as its clients. |
 
 ## Troubleshooting
 
@@ -528,8 +533,6 @@ with `--relay-secret`.
   causes are a dev server on a port outside the default list, a `file://` page
   (`Origin: null`), or an `--allow-origin` flag that replaced the localhost defaults.
   The relay logs `! refused upgrade: origin not allowed`.
-- **Upgrade refused with `421`.** The `Host` the node dialed is not one of the relay's
-  names. Add it with `--authority`; behind a proxy, forward the original `Host`.
 - **Upgrade refused with `404`.** The path is not under `/v1/`, so the client speaks
   another wire version (update it), or the splice ticket expired or was never given.
 - **Upgrade refused with `400`.** Behind a trusted proxy, the `X-Forwarded-For` chain
@@ -549,11 +552,10 @@ with `--relay-secret`.
 - **A client is disconnected mid-session.** It sent an oversize or invalid frame,
   exceeded a traffic budget, or missed a heartbeat pong. Reconnect with backoff. A splice
   also ends when its far end does not drain for 2 minutes.
-- **A node or app never registers, and the relay logs `! dropped: no secret`.** The
-  relay was started with `--secret`, and the client has none or another one.
-- **A node never registers.** The relay logs `! dropped: bad registration`: the node
-  signed for another authority than the `Host` the relay saw, which happens when a
-  proxy rewrites `Host` to another of the relay's names. Forward the original `Host`.
+- **A node never registers, and the relay logs nothing.** The relay was started with
+  `--secret` and the node has none or another one, or the node's URL names another key
+  than the relay's: a relay restarted without `--key` has a new one. Both look like a
+  relay that is down to the node, which redials.
 - **A call comes back unreachable.** The callee is not registered on this relay, or the
   caller's address already has a room's worth of calls waiting, or 8 splices to that key.
 - **Peers on different networks stay relayed.** Nodes cannot reach the relay's STUN, so they

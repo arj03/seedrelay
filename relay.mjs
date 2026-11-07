@@ -8,21 +8,22 @@
 // not trusted runtime surface: the kernel ships no server and its own tests use an
 // in-process relay.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { loadCrypto } from "seedkernel-wasm";
 import { bootShell } from "seedkernel-wasm/shell-core";
 import { nodeChannels, nodeDatagrams } from "seedkernel-wasm/shell-node";
 import { OpArgs } from "seedkernel-wasm/op-frame";
+import { deriveNodeKey } from "seedkernel-wasm/subkeys";
 
 // ─── limits ──────────────────────────────────────────────────────────────
 //
 // Independent caps that bound the relay's footprint against both accidental fan-out and
 // deliberate exhaustion. A room whose N members all stay relayed costs N(N-1) splice
-// sockets, N control sockets and N room sockets, and its smallest key, which calls the
-// rest, is charged 2(N-1) + 2 of them, its app's room socket included. The defaults fit
-// one full room so relayed on its share of the relay (992 of 1792 splice sockets) and
-// within its caller's share of an address (64 of 72, with room to redial); rooms whose
+// sockets and N relay links, and its smallest key, which calls the rest, is charged
+// 2(N-1) + 1 of them, its own relay link included. The defaults fit one full room so
+// relayed on its share of the relay (992 of 1792 splice sockets) and within its caller's
+// share of an address (63 of 72, with room to redial); rooms whose
 // pairs move to direct links cost far less.
 export const DEFAULT_LIMITS = Object.freeze({
   maxConns: 2048,      // sockets across the relay, including those still awaiting upgrade
@@ -65,8 +66,8 @@ const LIMIT_FLAGS = {
  *  Anything malformed or unknown throws: a relay that starts with a limit it was not given
  *  is worse than one that does not start. */
 export function parseOptions(argv, env = {}) {
-  const options = { port: 8080, host: "127.0.0.1", authorities: [], allowOrigins: [], trustedProxies: [], secrets: [],
-    limits: {}, stun: STUN_PORT };
+  const options = { port: 8080, host: "127.0.0.1", allowOrigins: [], trustedProxies: [], secrets: [],
+    open: false, limits: {}, stun: STUN_PORT, key: null };
   const number = (flag, value, max) => {
     const n = Number(value);
     if (typeof value !== "string" || value.trim() === "" || !Number.isFinite(n) || n < 0 || n > max ||
@@ -79,7 +80,6 @@ export function parseOptions(argv, env = {}) {
   for (const [name, variable, max] of Object.values(LIMIT_FLAGS)) {
     if (env[variable] !== undefined) options.limits[name] = number(variable, env[variable], max);
   }
-  for (const a of list(env.RELAY_AUTHORITIES)) options.authorities.push(authorityOption(a));
   for (const ip of list(env.RELAY_TRUSTED_PROXIES)) options.trustedProxies.push(proxyOption(ip));
   for (const secret of list(env.RELAY_SECRETS)) options.secrets.push(secretOption(secret));
   const stun = (flag, value) => (value === "off" ? null : number(flag, value, 65534));
@@ -94,44 +94,29 @@ export function parseOptions(argv, env = {}) {
     if (a in LIMIT_FLAGS) options.limits[LIMIT_FLAGS[a][0]] = number(a, value(), LIMIT_FLAGS[a][2]);
     else if (a === "--port") options.port = number(a, value(), 65535);
     else if (a === "--host") options.host = unbracket(value());
-    else if (a === "--authority") options.authorities.push(authorityOption(value()));
     else if (a === "--allow-origin") options.allowOrigins.push(value());
     else if (a === "--trusted-proxy") options.trustedProxies.push(proxyOption(value()));
     else if (a === "--secret") options.secrets.push(secretOption(value()));
+    else if (a === "--open") options.open = true;
     else if (a === "--stun") options.stun = stun(a, value());
+    else if (a === "--key") options.key = value();
     else if (/^\d+$/.test(a)) options.port = number("the port", a, 65535);
     else throw new Error(`unknown option ${a}`);
   }
   if (env.RELAY_SECRETS !== undefined && options.secrets.length === 0) {
     // An explicitly set variable with no secret is a half-configured private relay,
     // unless a --secret flag supplied one.
-    throw new Error("RELAY_SECRETS is set but names no secret; unset it for an open relay");
+    throw new Error("RELAY_SECRETS is set but names no secret; unset it for the relay's own");
   }
-  if (options.authorities.length === 0 && isWildcardHost(options.host)) {
-    const bound = options.host === "" ? "every interface" : options.host;
-    throw new Error(`a relay bound to ${bound} needs --authority: the host[:port] nodes dial it by`);
-  }
+  if (options.open && options.secrets.length > 0) throw new Error("--open takes no --secret: an open relay has none");
   return options;
 }
 
-function authorityOption(value) {
-  if (!/^[^\s/?#@]+$/.test(value)) throw new Error(`--authority takes host[:port] as nodes dial it, not ${JSON.stringify(value)}`);
-  return canonicalAuthority(value);
-}
-
-// A listener who saw one registration can test guesses at the secret against its MAC
-// offline, so a secret must be too long to guess.
-const MIN_SECRET_LEN = 16;
-
-/** A secret as it reads from --secret, RELAY_SECRETS and a client's file alike: the
- *  variable splits on commas and trims, as seedkernel trims its file, so neither may be
- *  in one. */
+/** A secret as it reads from --secret and RELAY_SECRETS: the relay's contact secret, 32
+ *  bytes in hex, as a node's is (seedkernel's contactSecret). */
 function secretOption(value) {
-  if (value.length < MIN_SECRET_LEN) throw new Error(`a secret takes at least ${MIN_SECRET_LEN} characters`);
-  if (value.includes(",") || value !== value.trim()) {
-    throw new Error("a secret takes no commas, and no whitespace at either end");
-  }
-  return value;
+  if (!/^[0-9a-fA-F]{64}$/.test(value)) throw new Error("a secret takes 64 hex characters, a 32-byte contact secret");
+  return value.toLowerCase();
 }
 
 function proxyOption(value) {
@@ -140,27 +125,12 @@ function proxyOption(value) {
   return ip;
 }
 
-/** Whether binding `host` listens on every interface. Node treats an empty host and every
- *  spelling of an unspecified address as a wildcard, so the --authority guard must too. */
-function isWildcardHost(host) {
-  const ip = normalizeIp(host);
-  return host === "" || ip === "0.0.0.0" || ip === "::";
-}
-
 const LOOPBACK_NAMES = ["localhost", "127.0.0.1", "::1"];
 
 /** Whether `host`, as `parseOptions` gives it, is reachable from this machine only. */
 export function isLoopbackHost(host) {
   const ip = normalizeIp(host);
   return host === "localhost" || ip === "::1" || /^127\./.test(ip ?? "");
-}
-
-/** The names a relay bound to `host` answers to when none are given: the loopback names
- *  on a loopback address, else the address itself. A relay nodes reach under any other
- *  name (a public one, behind a proxy), or bound to every interface, needs `--authority`. */
-export function localAuthorities(host, port) {
-  const names = isLoopbackHost(host) ? LOOPBACK_NAMES : [normalizeIp(host) ?? host];
-  return names.map((name) => canonicalAuthority(`${bracket(name)}:${port}`));
 }
 
 // Opaque origins (including file pages and sandboxed iframes) are not allowed by default.
@@ -197,40 +167,45 @@ function normalizeIp(value) {
   return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
 }
 
-/** Lowercase, without a default port, so the Host a browser sends for
- *  wss://relay.example matches the relay.example:443 a node dials. */
-function canonicalAuthority(host) {
-  return host.toLowerCase().replace(/:(?:80|443)$/, "");
-}
-
 // ─── the bundle ──────────────────────────────────────────────────────────
 
 /** The signed bundle, as scripts/build.mjs writes it. */
 export const RELAY_BUNDLE = new URL("./bundle/relay.skb", import.meta.url);
 
 /** The bundle's signed settings; the operator's override any of them (`relayConfig`). */
-export const RELAY_DEFAULTS = { limits: DEFAULT_LIMITS, authorities: [], allowOrigins: LOCAL_ORIGINS, trustedProxies: [],
-  secrets: [], stun: STUN_PORT };
+export const RELAY_DEFAULTS = { limits: DEFAULT_LIMITS, allowOrigins: LOCAL_ORIGINS, trustedProxies: [],
+  secrets: [], open: false, stun: STUN_PORT };
 
 /** The operator's settings, from `parseOptions`, as the bundle reads them: what a node
  *  passes it as `--transport-config`. An empty `allowOrigins` keeps the localhost
  *  defaults. */
 export function relayConfig(options) {
-  const config = { limits: options.limits, authorities: options.authorities, trustedProxies: options.trustedProxies,
-    secrets: options.secrets, stun: options.stun };
+  const config = { limits: options.limits, trustedProxies: options.trustedProxies,
+    secrets: options.secrets, open: options.open, stun: options.stun };
   if (options.allowOrigins.length > 0) config.allowOrigins = options.allowOrigins;
   return config;
 }
 
+/** The relay's identity: its key is what every node's relay link is pinned to, so it is kept
+ *  in `path` (a master seed in hex, as seedkernel's `--key` keeps a node's, and written
+ *  there on first use), or fresh for this run when there is no path. */
+function relayIdentity(sodium, path) {
+  if (path === null) return sodium.crypto_sign_keypair();
+  if (!existsSync(path)) writeFileSync(path, Buffer.from(sodium.randombytes_buf(32)).toString("hex") + "\n", { mode: 0o600 });
+  const seed = readFileSync(path, "utf8").trim();
+  if (!/^[0-9a-f]{64}$/.test(seed)) throw new Error(`--key ${path}: not a 64-character hex seed`);
+  return deriveNodeKey(sodium, Buffer.from(seed, "hex"));
+}
+
 /** Run the relay on a seedkernel node in this process, listening on `options.host` and
- *  `options.port`. Answers the port it bound, the STUN ports, the names it answers to, and
- *  `close`, which tells every socket the relay is restarting and then stops the node. Each
- *  of the relay's log lines goes to `log`. */
+ *  `options.port`. Answers the port it bound, the STUN ports, its key (hex), and `close`, which tells every socket the relay is restarting and then stops
+ *  the node. Each of the relay's log lines goes to `log`. */
 export async function startRelay(options, log = (line) => console.log(line)) {
   const sodium = await loadCrypto();
+  const identity = relayIdentity(sodium, options.key ?? null);
   const { shell, transport } = await bootShell({
     sodium,
-    identity: sodium.crypto_sign_keypair(),
+    identity,
     services: { transport: {
       bundle: readFileSync(RELAY_BUNDLE),
       listen: [{ label: "ws", host: options.host, port: options.port }],
@@ -243,14 +218,17 @@ export async function startRelay(options, log = (line) => console.log(line)) {
   });
   try {
     const port = transport.portOf("ws");
-    const authorities = options.authorities.length > 0 ? options.authorities : localAuthorities(options.host, port);
-    const start = new OpArgs("start");
-    for (const name of authorities) start.text(name);
-    const answer = await shell.call(RELAY_SERVICE, start.build());
+    const answer = await shell.call(RELAY_SERVICE, new OpArgs("start").build());
+    const secretEnd = 1 + answer[0];
+    const secret = answer[0] === 0 ? null : Buffer.from(answer.subarray(1, secretEnd)).toString("hex");
     const stunPorts = [];
-    for (let at = 0; at + 2 <= answer.length; at += 2) stunPorts.push((answer[at] << 8) | answer[at + 1]);
+    for (let at = secretEnd; at + 2 <= answer.length; at += 2) stunPorts.push((answer[at] << 8) | answer[at + 1]);
+    const key = Buffer.from(identity.publicKey).toString("hex");
     return {
-      port, stunPorts, authorities,
+      port, stunPorts, key, secret,
+      /** What a node registers with: `ws://<key>[.<secret>]@<authority>`, the secret left
+       *  out for an open relay. */
+      url: (authority) => `ws://${key}${secret ? "." + secret : ""}@${authority}`,
       async close(graceMs = 2000) {
         await shell.call(RELAY_SERVICE, new OpArgs("close").build());
         await new Promise((r) => setTimeout(r, graceMs).unref());

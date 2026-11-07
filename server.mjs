@@ -7,8 +7,6 @@
 // Run: seedrelay [port] [options]  (or: node server.mjs)
 //   --port N               port to listen on (default 8080; a bare number works too)
 //   --host HOST            interface to bind (default 127.0.0.1)
-//   --authority NAME       a host[:port] nodes dial this relay by (repeatable; env
-//                          RELAY_AUTHORITIES; default the bound address's own names)
 //   --allow-origin ORIGIN  allow this Origin (repeatable; replaces the localhost defaults)
 //   --max-conns N          total concurrent sockets        (env RELAY_MAX_CONNS)
 //   --max-rooms N          total concurrent rooms          (env RELAY_MAX_ROOMS)
@@ -23,13 +21,18 @@
 //                                                          (env RELAY_SPLICE_RATE)
 //   --heartbeat-secs N     ping/reap interval, 0=off       (env RELAY_HEARTBEAT_SECS)
 //   --trusted-proxy IP     trust this proxy address (repeatable; env RELAY_TRUSTED_PROXIES)
-//   --secret SECRET        register only nodes and apps given this secret, 16+ characters,
-//                          no commas (repeatable; env RELAY_SECRETS, which keeps it out of `ps`)
+//   --secret SECRET        the contact secret a node must hold, 64 hex characters, in place
+//                          of the one the relay derives from its key (repeatable; env
+//                          RELAY_SECRETS, which keeps it out of `ps`)
+//   --open                 take any node, with no secret: an open relay is in public
+//   --key FILE             keep the relay's identity in FILE, a hex seed written on first
+//                          start; without it the relay's key, and so its address and its
+//                          secret, are new each run
 //   --stun PORT|off        answer STUN on this UDP port and the next, on every interface
 //                          (default 3478; 0 for two the OS picks; env RELAY_STUN)
 //   --print-config         print the settings as a native node's --transport-config, and exit
 
-import { bracket, DEFAULT_LIMITS, isLoopbackHost, localAuthorities, parseOptions, relayConfig, startRelay } from "./relay.mjs";
+import { bracket, DEFAULT_LIMITS, isLoopbackHost, parseOptions, relayConfig, startRelay } from "./relay.mjs";
 
 const args = process.argv.slice(2);
 const printConfig = args.includes("--print-config");
@@ -42,9 +45,7 @@ try {
 }
 
 if (printConfig) {
-  const config = relayConfig(options);
-  if (config.authorities.length === 0) config.authorities = localAuthorities(options.host, options.port);
-  console.log(JSON.stringify(config, null, 2));
+  console.log(JSON.stringify(relayConfig(options), null, 2));
   process.exit(0);
 }
 
@@ -57,10 +58,10 @@ try {
   process.exit(1);
 }
 const l = { ...DEFAULT_LIMITS, ...options.limits };
-console.log(`seedrelay listening on ws://${bracket(host)}:${relay.port}/v1/`);
-console.log(`  answers to: ${relay.authorities.join(", ")}`);
+console.log(`seedrelay listening on ${relay.url(`${bracket(host)}:${relay.port}`)}`);
+if (options.key === null) console.log("  key: new this run; pass --key FILE to keep it, and the address with it");
 console.log(`  origin allowlist: ${options.allowOrigins.length ? options.allowOrigins.slice(0, 4).join(", ") : "localhost pages"}`);
-console.log(`  registration: ${options.secrets.length ? `needs a secret (${options.secrets.length} accepted)` : "open to any key"}`);
+console.log(`  registration: ${options.open ? "OPEN: anyone may register, call, and ask who is here" : options.secrets.length ? `needs a contact secret (${options.secrets.length} accepted)` : "needs the secret in its URL"}`);
 console.log(`  limits: ${l.maxConns} conns, ${l.maxRooms} rooms, ${l.maxPerRoom}/room, ${l.maxPerIp}/ip, ${l.maxPerRoomIp}/ip in a room, ` +
   `IPv6 by /${l.ipv6Prefix}, registrations ${l.registerRate > 0 ? `${l.registerRate}/s per ip` : "unmetered"}, ` +
   `splices ${l.spliceRate > 0 ? `${l.spliceRate} KiB/s per ip` : "unmetered"}${options.trustedProxies.length ? " (X-Forwarded-For trusted)" : ""}`);

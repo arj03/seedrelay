@@ -17,7 +17,7 @@
 //
 // The relay sees this front as its client, so it needs --trusted-proxy with the address
 // this front dials it from (127.0.0.1) to read the visitor's own from X-Forwarded-For,
-// --authority NAME:PORT, and --allow-origin https://NAME:PORT for the page.
+// and --allow-origin https://NAME:PORT for the page.
 //
 // The certificate is read once: restart the front after it renews. It is read, and the
 // port bound, before the front drops to --user, so --root must be readable by that user.

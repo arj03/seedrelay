@@ -1,24 +1,24 @@
 // The relay as a seedkernel bundle: the guest of a node whose link occupant it is, so the
 // host's sockets, listeners and datagram sockets are its own (seedkernel §12.1, §12.7).
-// A node registers its key here over a control socket, its app meets other keys in rooms,
-// and the node reaches any registered key through a splice: two fresh sockets the relay
-// joins, copying frames between them. The seedkernel channel handshake runs end to end
-// through a splice, so the relay forwards ciphertext it cannot read, and cannot pose as
-// either end.
+// A node holds one relay link here, a seedkernel channel with this relay as its responder
+// and pinned to this relay's key, so everything on it travels in records and nothing on
+// the path names a key. The link is the node's registration: the relay routes calls to
+// the key its handshake proved. Over it the node reaches any registered key through a
+// splice, two fresh sockets the relay joins, copying frames between them, and meets other
+// keys in rooms. The channel handshake between the two nodes runs end to end through a
+// splice, so the relay forwards ciphertext it cannot read, and cannot pose as either end.
 //
 // Sockets, by upgrade path. The first segment names the wire version, and any other path
 // is refused, so a relay and a node never guess at each other's wire:
 //
-//   ws://host:port/v1/                a control socket: a node's transport, reachable by key
-//   ws://host:port/v1/rooms           a room socket: an app, meeting others in rooms
+//   ws://host:port/v1/                a relay link: a node's transport, reachable by key
 //   ws://host:port/v1/?splice=<hex>   one end of a splice, named by a 16-byte ticket
 //
-// Both kinds must register before anything else: the relay sends a nonce, and the key
-// holder signs it for the name it dialed, which must be one this relay answers to. Both
-// signatures are under the host's link scope, which `node/verify` checks here, each under
-// a tag of its own, so neither kind can stand for the other. The relay routes calls to the
-// control socket that registered a key most recently. Rooms are discovery only, named by
-// 32-byte ids; a room id is a bearer credential for learning who is there.
+// The channel is seedkernel's own (util.js, ake.js and framing.js, put in front of this
+// program by scripts/build.mjs), which a relay runs as every node does; the settings it
+// reads, which a node's transport declares in core.js, are declared here. The relay routes
+// calls to the link that registered a key most recently. Rooms are discovery only, named
+// by 32-byte ids; a room id is a bearer credential for learning who is there.
 //
 // A call hands each end a ticket, and the relay joins the two splice sockets that bring
 // them. What splices carry is metered per client address, and both ends are charged to
@@ -26,61 +26,31 @@
 //
 // This program reads its settings from `APP` (the signed defaults) and `LOCAL` (the
 // operator's), takes the host's raw-link events, and answers the host-only ops `start`
-// and `close` on its local service id. The op-frame prelude (callerOf, readOp, utf8Encode,
-// utf8Decode) is injected at the marker at the end.
+// and `close` on its local service id.
 
 "use strict";
 
 // ─── bytes ───────────────────────────────────────────────────────────────
 
-const EMPTY = new Uint8Array(0);
-
-function concatBytes(parts) {
-  let len = 0;
-  for (const p of parts) len += p.length;
-  const out = new Uint8Array(len);
-  let off = 0;
-  for (const p of parts) { out.set(p, off); off += p.length; }
-  return out;
-}
+// EMPTY, concatBytes, toHex and fromHex are the channel's (util.js).
 const of = (...bytes) => Uint8Array.from(bytes);
 function u32(v) {
   return of(v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255);
 }
 const readU16 = (b, at) => (b[at] << 8) | b[at + 1];
 const readU32 = (b, at) => ((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0;
-const HEX = Array.from({ length: 256 }, (_, i) => (i < 16 ? "0" : "") + i.toString(16));
-function toHex(b) {
-  let s = "";
-  for (let i = 0; i < b.length; i++) s += HEX[b[i]];
-  return s;
-}
-function fromHex(s) {
-  const out = new Uint8Array(s.length >> 1);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(2 * i, 2), 16);
-  return out;
-}
 /** Bytes as text one character each, as HTTP heads are read. */
 function latin1(b) {
   let s = "";
   for (let i = 0; i < b.length; i += 4096) s += String.fromCharCode.apply(null, b.subarray(i, i + 4096));
   return s;
 }
-/** Whether two byte strings are equal, in time that depends on their length only. */
-function sameBytes(a, b) {
-  if (a.length !== b.length) return false;
-  let d = 0;
-  for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
-  return d === 0;
-}
-
 // ─── the host ────────────────────────────────────────────────────────────
 
 const N_SEND = "link/send", N_PAUSE = "link/pause", N_CLOSE = "link/close", N_STATUS = "link/status";
 const N_UDP_BIND = "link/udpBind", N_UDP_SEND = "link/udpSend";
-const N_TIMER_ARM = "timer/arm", N_VERIFY = "node/verify", N_HASH = "crypto/blake2b", N_RANDOM = "crypto/random";
-/** This bundle's RFC 6455 module (seedkernel's ws.wasm): masking, and the accept value. */
-const N_WS = "ws", WS_OP_MASK = 1, WS_OP_ACCEPT = 2;
+// N_TIMER_ARM, N_RANDOM, and N_WS for this bundle's RFC 6455 module (seedkernel's
+// ws.wasm, masking and the accept value), are the channel's (ake.js, framing.js).
 
 /** What a link still holds for the wire, after writing `bytes` to it (none only asks). */
 function linkSend(id, bytes) {
@@ -302,12 +272,6 @@ function addressKey(ip, prefix) {
   return groups.join(":") + "/" + prefix;
 }
 
-/** Lowercase, without a default port, so the Host a browser sends for
- *  wss://relay.example matches the relay.example:443 a node dials. */
-function canonicalAuthority(host) {
-  return host.toLowerCase().replace(/:(?:80|443)$/, "");
-}
-
 // ─── settings ────────────────────────────────────────────────────────────
 
 /** A setting: the operator's, else the signed default. */
@@ -321,14 +285,27 @@ const limits = { ...APP.limits, ...LOCAL.limits };
 for (const [name, v] of Object.entries(limits)) {
   if (typeof v !== "number" || !(v >= 0) || v === Infinity) throw new Error(`relay: config limits.${name} must be a non-negative number`);
 }
-const authorities = new Set(strings("authorities").map(canonicalAuthority));
 const origins = new Set(strings("allowOrigins"));
 const proxies = new Set(strings("trustedProxies").map((ip) => {
   const n = normalizeIp(ip);
   if (!n) throw new Error(`relay: config trustedProxies has ${JSON.stringify(ip)}, not an IP address`);
   return n;
 }));
-const secrets = strings("secrets").map((s) => utf8Encode(s));
+/** The contact secrets a relay link's msg1 may open under. By default the relay's key's
+ *  own (ake.js `keySecret`), which its URL carries, `ws://<key>.<secret>@host`, so only a
+ *  node given that URL can register, call or ask who is here. `secrets` names others
+ *  instead (more than one while a new one rolls out); `open` takes none, so anyone may. */
+const configuredSecrets = strings("secrets").map((s) => {
+  if (!/^[0-9a-f]{64}$/.test(s)) throw new Error("relay: config secrets must be 64 lowercase hex characters each");
+  return fromHex(s);
+});
+const openRelay = setting("open") ?? false;
+if (typeof openRelay !== "boolean") throw new Error("relay: config open must be true or false");
+if (openRelay && configuredSecrets.length > 0) throw new Error("relay: an open relay takes no secrets");
+async function acceptSecrets() {
+  if (openRelay) return [new Uint8Array(32)];
+  return configuredSecrets.length > 0 ? configuredSecrets : [await keySecret()];
+}
 /** The first of the two UDP ports STUN is answered on; 0 lets the OS pick both, and null
  *  answers none. */
 const stunPort = setting("stun");
@@ -338,12 +315,11 @@ if (stunPort !== null && !(Number.isInteger(stunPort) && stunPort >= 0 && stunPo
 
 // ─── safety limits ───────────────────────────────────────────────────────
 //
-// A client sends a registration (97 bytes, 161 with a secret's MAC), a call (49) or a join
-// or leave (33): a frame past this is not the wire. Splice frames are not measured, since
-// the relay streams them through without holding one whole.
-const MAX_CONTROL_PAYLOAD = 256;
-// Every write to a control or room socket, including control frames, shares the same
-// hard backlog cap.
+// A node sends its handshake (msg1 is 1,233 bytes) and then records of a call (49 bytes
+// and a tag) or a tell (a join or leave, 34): a frame past this is not the wire. Splice
+// frames are not measured, since the relay streams them through without holding one whole.
+const MAX_CONTROL_PAYLOAD = 2048;
+// Every write to a relay link, including control frames, shares the same hard backlog cap.
 const MAX_SOCKET_BACKLOG = 256 * 1024;
 // From the TCP connection to the upgrade, and from the upgrade to registration.
 const HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -366,7 +342,7 @@ const MAX_HEAD_BYTES = 16 * 1024;
 const UNMASK_HERE_BELOW = 128;
 
 const REFUSALS = { 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 409: "Conflict",
-  421: "Misdirected Request", 429: "Too Many Requests", 431: "Request Header Fields Too Large",
+  429: "Too Many Requests", 431: "Request Header Fields Too Large",
   503: "Service Unavailable" };
 
 // ─── STUN ────────────────────────────────────────────────────────────────
@@ -400,57 +376,60 @@ function stunResponse(msg, ip, port) {
 
 // ─── the relay wire ──────────────────────────────────────────────────────
 //
-// Both kinds of socket carry binary frames whose first byte is the type. Keys are 32-byte
-// seedkernel identities, rooms 32-byte ids, tickets 16 random bytes.
+// Records on a relay link, `[type u8][body]`. Keys are 32-byte seedkernel identities,
+// rooms 32-byte ids, tickets 16 random bytes.
 //
-//   relay → client                                client → relay
-//   0x00 challenge   [nonce 32]                   0x01 register  [pk 32][sig 64][mac 64]?
-//   0x01 registered
+//   relay → node                                  node → relay
+//   0x01 registered                               0x05 call [to 32][ticket 16]
+//   0x05 incoming    [from 32][ticket 16]         0x08 tell [message]
+//   0x06 unreachable [to 32][ticket 16]
+//   0x08 tell        [message]
 //
-// then on a control socket                        on a room socket
-//   0x05 incoming    [from 32][ticket 16]         0x02 join      [room 32]
-//   0x06 unreachable [to 32][ticket 16]           0x03 leave     [room 32]
-//   (node → relay 0x05 call [to 32][ticket 16])   0x02 members   [room 32][pk 32]*
-//                                                 0x03 joined    [room 32][pk 32]
-//                                                 0x04 left      [room 32][pk 32]
-//                                                 0x07 refused   [room 32]
-const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_MEMBERS = 0x02, T_JOINED = 0x03,
-  T_LEFT = 0x04, T_CALL = 0x05, T_UNREACHABLE = 0x06, T_REFUSED = 0x07;
+// A tell carries what the relay offers beside calls, which a node's transport passes on
+// unread, to and from its host: rooms. Their messages, `[type u8][body]`:
+//
+//   relay → node                                  node → relay
+//   0x02 members     [room 32][pk 32]*            0x02 join  [room 32]
+//   0x03 joined      [room 32][pk 32]             0x03 leave [room 32]
+//   0x04 left        [room 32][pk 32]
+//   0x07 refused     [room 32]
+const R_REGISTERED = 0x01, R_CALL = 0x05, R_UNREACHABLE = 0x06, R_TELL = 0x08;
+const T_MEMBERS = 0x02, T_JOINED = 0x03, T_LEFT = 0x04, T_REFUSED = 0x07;
 const T_JOIN = 0x02, T_LEAVE = 0x03;
-const PK_LEN = 32, SIG_LEN = 64, MAC_LEN = 64, NONCE_LEN = 32, TICKET_LEN = 16, ROOM_LEN = 32;
+const TICKET_LEN = 16, ROOM_LEN = 32;
 
-// A registration is an Ed25519 signature by the node's identity key over
-//   DOMAIN_link_scope ‖ DOMAIN_RELAY ‖ authority ‖ nonce     on a control socket
-//   DOMAIN_link_scope ‖ DOMAIN_ROOMS ‖ authority ‖ nonce     on a room socket
-// where DOMAIN_link_scope is the prefix seedkernel's host puts in front of everything its
-// link occupant signs, and checks for it here through `node/verify`, so this program
-// names only the tag after it. The authority is the relay's host[:port] as the client
-// dialed it, and must be one of this relay's own names, never whatever Host a socket
-// sends: otherwise relay A could take a nonce from relay B, have one of its visitors sign
-// it for a.example, and present that to B as Host a.example.
-const DOMAIN_RELAY = utf8Encode("seedkernel-relay-register-v1\0");
-const DOMAIN_ROOMS = utf8Encode("seedrelay-rooms-v1\0");
-// A relay with secrets takes a registration only with the MAC
-//   BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret)
-// after its signature, which binds it to the socket's nonce and key. BLAKE2b cannot be
-// length-extended, so hashing the secret in makes a MAC.
-const DOMAIN_SECRET = utf8Encode("seedrelay-secret-v1\0");
-
-async function verifyRegistration(rooms, pk, sig, authority, nonce) {
-  const r = await host.call(N_VERIFY, concatBytes([pk, sig, rooms ? DOMAIN_ROOMS : DOMAIN_RELAY, utf8Encode(authority), nonce]));
-  return r[0] === 1;
+// ─── the channel's settings ──────────────────────────────────────────────
+//
+// What ake.js reads that a node's transport declares in core.js: a relay link runs on the
+// public network's root, with this relay's identity and no peer lint, and its accepts take
+// the relay's contact secrets (`acceptSecrets`). Its deadlines
+// are the relay's handshake deadline, and an authenticated link never idles out: the
+// heartbeat reaps a dead one.
+const ZERO32 = new Uint8Array(32);
+const networkKey = ZERO32, admitPeers = null;
+const ownPk = fromHex(HOST.identity);
+// What a node sends is held to MAX_CONTROL_PAYLOAD as it is read, so the channel's cap is
+// the largest record the relay sends, a full room's members tell, which a node takes
+// (its own cap is far larger). Records wait for the wire only as long as one write takes,
+// so the queue is the socket's backlog cap.
+const maxFrameBytes = Math.max(MAX_CONTROL_PAYLOAD, 2 + ROOM_LEN + PK_LEN * limits.maxPerRoom + TAG_LEN);
+const maxOutboundQueueBytes = MAX_SOCKET_BACKLOG, maxOutboundQueueSlices = 4096, maxPreAuthQueueSlices = 64;
+const handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS, unverifiedTimeoutMs = HANDSHAKE_TIMEOUT_MS, linkIdleTimeoutMs = 0;
+/** Records per direction between ratchets: a node's relay links use the same, fixed. */
+const rekeyAfterFrames = 1 << 24;
+/** A link deadline `ms` from now, with a wake to see it. */
+function dueIn(ms) {
+  later(ms, () => {
+    const t = now();
+    for (const entry of conns.values()) {
+      if (entry.conn instanceof ControlConn) entry.conn.link.onWake(t);
+    }
+  });
+  return now() + ms;
 }
-
-/** Whether a registration's MAC shows it knows one of the secrets, if there are any. */
-async function admits(pk, sig, mac) {
-  if (secrets.length === 0) return true;
-  if (mac.length !== MAC_LEN) return false;
-  let known = false;
-  for (const secret of secrets) {
-    const proof = await host.call(N_HASH, concatBytes([of(64, 0), DOMAIN_SECRET, pk, sig, secret]));
-    known = sameBytes(proof, mac) || known;
-  }
-  return known;
+/** A host call nothing waits on. */
+function callRetried(name, bytes) {
+  try { void host.call(name, bytes).catch(() => {}); } catch { /* the socket goes with its entry */ }
 }
 
 /** A server→client frame header for a payload of `len` bytes, with the client frame's own
@@ -463,7 +442,6 @@ function frameHead(b0, len) {
 
 // Encode a server→client frame (unmasked per RFC 6455).
 const encodeFrame = (opcode, payload) => concatBytes([frameHead(0x80 | opcode, payload.length), payload]);
-const typed = (type, ...parts) => encodeFrame(0x2, concatBytes([of(type), ...parts]));
 const closeFrame = (code) => encodeFrame(0x8, of(code >> 8, code & 255));
 const PING = encodeFrame(0x9, EMPTY);
 
@@ -636,7 +614,7 @@ const addressOf = (ip) => addressKey(ip, limits.ipv6Prefix);
 
 // ─── rooms ───────────────────────────────────────────────────────────────
 //
-// A registered room socket holds a seat in each room it joined, up to MAX_ROOMS_PER_CONN
+// A registered relay link holds a seat in each room it joined, up to MAX_ROOMS_PER_CONN
 // at once. A room's members are the distinct keys seated in it, so a key on two sockets
 // is one member. A joiner is never turned away for what announcing it costs: an address
 // joins rooms at the registration rate, after a burst of JOIN_BURST, which bounds how
@@ -651,7 +629,7 @@ class Room {
   constructor(id) {
     this.id = id;              // hex
     this.idBytes = fromHex(id);
-    this.conns = new Set();    // the room sockets seated here
+    this.conns = new Set();    // the relay links seated here
   }
 
   seats(addr) {
@@ -678,7 +656,7 @@ class Room {
       if (c.key === conn.key) already = true; else known.set(c.key, c.pk);
     }
     this.conns.add(conn);
-    conn.send(typed(T_MEMBERS, this.idBytes, ...known.values()));
+    conn.tellRooms(T_MEMBERS, this.idBytes, ...known.values());
     if (!already) this.tell(T_JOINED, conn);
   }
 
@@ -690,25 +668,21 @@ class Room {
   }
 
   tell(type, conn) {
-    const frame = typed(type, this.idBytes, conn.pk);
     for (const c of this.conns) {
-      if (c.key !== conn.key) c.send(frame);
+      if (c.key !== conn.key) c.tellRooms(type, this.idBytes, conn.pk);
     }
   }
 }
 
-// ─── control and room sockets ────────────────────────────────────────────
+// ─── relay links ─────────────────────────────────────────────────────────
 
-const routes = new Map();     // key hex to its registered control sockets, the latest last
+const routes = new Map();     // key hex to its registered relay links, the latest last
 
 class ControlConn {
-  constructor(entry, addr, authority, forRooms, nonce) {
+  constructor(entry, addr) {
     this.entry = entry;
     this.addr = addr;          // the client address, as accounted
-    this.forRooms = forRooms;  // a room socket, rather than a node's control socket
     this.rooms = new Map();    // room id hex to the Room it holds a seat in
-    this.authority = authority;
-    this.nonce = nonce;
     this.key = null;           // hex, once registered
     this.pk = null;            // and its bytes
     this.alive = true;         // cleared each heartbeat, set on pong
@@ -719,11 +693,29 @@ class ControlConn {
     this.messages = [];        // whole messages read from one chunk, handled in order
     this.frame = null;         // a data frame's payload as it arrives
     this.frameAt = 0;
-    this.registerTimer = later(HANDSHAKE_TIMEOUT_MS, () => destroy(entry));
-    this.send(typed(T_CHALLENGE, nonce));
+    // The channel, this relay its responder: each WebSocket message is one of its
+    // messages, and what it sends goes out as one binary frame. A refusal before the node
+    // has proved itself is silence until the deadline, as on any seedkernel accept.
+    this.link = new Link({
+      linkId: entry.id, stream: false, dest: "", listener: "", weDialed: false, limiter: null, dialedPeerId: null,
+      acceptSecrets, idleMs: 0,
+      channel: {
+        send: (bytes) => { this.send(encodeFrame(0x2, bytes)); return Promise.resolve(); },
+        close: (graceful) => shut(entry, graceful),
+      },
+      onAuth: () => this.register(),
+      onFrame: (_peer, m) => this.onRecord(m),
+      onClose: () => destroy(entry),
+    });
   }
 
   send(frame) { write(this.entry, frame); }
+
+  /** One record of the relay wire, once the link is up. */
+  record(type, ...parts) { void this.link.send(concatBytes([of(type), ...parts])); }
+
+  /** One rooms message, in a tell. */
+  tellRooms(type, ...parts) { this.record(R_TELL, of(type), ...parts); }
 
   /** One chunk: every byte is charged before it is parsed, every frame before it is acted
    *  on, and its messages are handled in order, each once the one before is done. */
@@ -762,47 +754,44 @@ class ControlConn {
     return true;
   }
 
-  /** False once the socket is torn down, which stops the read. */
+  /** One WebSocket message, to the channel. False once the socket is torn down, which
+   *  stops the read. */
   async onMessage(payload) {
-    const type = payload[0], body = payload.subarray(1);
-    if (type === T_REGISTER && (body.length === PK_LEN + SIG_LEN || body.length === PK_LEN + SIG_LEN + MAC_LEN) &&
-        !this.key) {
-      const sigEnd = PK_LEN + SIG_LEN;
-      return this.register(body.subarray(0, PK_LEN), body.subarray(PK_LEN, sigEnd), body.subarray(sigEnd));
-    }
-    const forRooms = this.key && this.forRooms, calls = this.key && !this.forRooms;
-    if (type === T_JOIN && body.length === ROOM_LEN && forRooms) return this.join(body);
-    if (type === T_LEAVE && body.length === ROOM_LEN && forRooms) return this.leave(toHex(body));
-    if (type === T_CALL && body.length === PK_LEN + TICKET_LEN && calls) {
-      return this.call(body.subarray(0, PK_LEN), body.subarray(PK_LEN));
-    }
-    // Anything else, including a join or a call before registering or on the other kind
-    // of socket, is not this wire.
-    return this.drop("unexpected control frame");
+    await this.link.onWire(payload);
+    return !this.entry.closed;
   }
 
-  /** Tear the socket down for `why`: false, which stops the read. */
+  /** A record from a registered node. */
+  onRecord(m) {
+    const type = m[0], body = m.subarray(1);
+    if (type === R_CALL && body.length === PK_LEN + TICKET_LEN) {
+      void this.call(body.subarray(0, PK_LEN), body.subarray(PK_LEN));
+    } else if (type === R_TELL && body.length === 1 + ROOM_LEN && body[0] === T_JOIN) {
+      this.join(body.subarray(1));
+    } else if (type === R_TELL && body.length === 1 + ROOM_LEN && body[0] === T_LEAVE) {
+      this.leave(toHex(body.subarray(1)));
+    } else {
+      this.drop("unexpected record");
+    }
+  }
+
+  /** Tear the socket down for `why`. */
   drop(why) {
     log(`! dropped: ${why}`);
     destroy(this.entry);
-    return false;
   }
 
-  async register(pk, sig, mac) {
-    if (!(await admits(pk, sig, mac))) return this.drop("no secret");
-    if (!(await verifyRegistration(this.forRooms, pk, sig, this.authority, this.nonce))) return this.drop("bad registration");
-    if (this.entry.closed) return false;
-    cancel(this.registerTimer);
-    this.pk = pk.slice();
-    this.key = toHex(this.pk);
-    if (!this.forRooms) route(this);
-    this.send(typed(T_REGISTER));
-    return true;
+  /** The node proved its key at msg3: that is its registration. */
+  register() {
+    this.pk = this.link.peerPubkey;
+    this.key = this.link.peerId;
+    route(this);
+    this.record(R_REGISTERED);
   }
 
   join(idBytes) {
     const id = toHex(idBytes);
-    if (this.rooms.has(id)) return true;
+    if (this.rooms.has(id)) return;
     let room = rooms.get(id) ?? null;
     const refusal = this.rooms.size >= MAX_ROOMS_PER_CONN ? "rooms per socket"
       : !room && rooms.size >= limits.maxRooms ? `room table full (${rooms.size} rooms)`
@@ -811,23 +800,21 @@ class ControlConn {
       : joins && !joins.get(this.addr).spend(1) ? "join rate" : null;
     if (refusal) {
       log(`! refused join: ${refusal}`);
-      this.send(typed(T_REFUSED, idBytes));
-      return true;
+      this.tellRooms(T_REFUSED, idBytes);
+      return;
     }
     if (!room) rooms.set(id, room = new Room(id));
     this.rooms.set(id, room);
     log(`+ member (${room.conns.size + 1} in room, ${rooms.size} rooms)`);
     room.join(this);
-    return !this.entry.closed;
   }
 
   leave(id) {
     const room = this.rooms.get(id);
-    if (!room) return true;
+    if (!room) return;
     this.rooms.delete(id);
     room.leave(this);
     log(`- member (${room.conns.size} in room, ${rooms.size} rooms)`);
-    return true;
   }
 
   async call(to, ticket) {
@@ -835,9 +822,8 @@ class ControlConn {
     // No such key here, the caller's own, too many calls from this address, or a ticket
     // already in use: the caller learns now instead of waiting its splice socket out.
     const splice = callee && callee.key !== this.key ? await openSplice(this, callee.key, ticket) : null;
-    if (!splice) { this.send(typed(T_UNREACHABLE, to, ticket)); return true; }
-    callee.send(typed(T_CALL, this.pk, fromHex(splice.calleeTicket)));
-    return true;
+    if (!splice) { this.record(R_UNREACHABLE, to, ticket); return; }
+    callee.record(R_CALL, this.pk, fromHex(splice.calleeTicket));
   }
 
   beat() {
@@ -853,9 +839,9 @@ class ControlConn {
   }
 
   onClose() {
-    cancel(this.registerTimer);
-    unroute(this);
+    if (this.key) unroute(this);
     for (const id of [...this.rooms.keys()]) this.leave(id);
+    this.link.onChannelClosed();
   }
 }
 
@@ -1249,19 +1235,17 @@ function parseRequest(text) {
   return { method: m[1], url: m[2], headers, upgrade: connection.includes("upgrade") && "upgrade" in headers };
 }
 
-/** What an upgrade asks for, `{ splice, rooms }` (splice null for a control or room
- *  socket), or the status refusing it: 404 for any path but the wire version's own, 400
- *  for a malformed ticket. */
+/** What an upgrade asks for, `{ splice }` (null for a relay link), or the status refusing
+ *  it: 404 for any path but the wire version's own, 400 for a malformed ticket. */
 function targetFromUrl(url) {
   const q = url.indexOf("?");
   const path = (q < 0 ? url : url.slice(0, q)).split("#", 1)[0];
   const query = q < 0 ? "" : url.slice(q + 1).split("#", 1)[0];
-  if (path === "/v1/rooms") return { splice: null, rooms: true };
   if (path !== "/v1" && path !== "/v1/") return 404;
   const ticket = /(?:^|&)splice=([0-9a-f]{32})(?:&|$)/.exec(query);
-  if (ticket) return { splice: ticket[1], rooms: false };
+  if (ticket) return { splice: ticket[1] };
   if (/(?:^|&)splice=/.test(query)) return 400;
-  return { splice: null, rooms: false };
+  return { splice: null };
 }
 
 // Walk from the actual remote address `ip` toward the client, stopping at the first
@@ -1320,14 +1304,10 @@ async function upgrade(entry, req, head) {
     return;
   }
 
-  const authority = canonicalAuthority(req.headers.host ?? "");
-  if (!authorities.has(authority)) { refuse(entry, 421, "not a name this relay answers to"); return; }
   if (!bill(entry, addr)) { refuse(entry, 429, "per-ip cap"); return; }
   if (registrations && !registrations.get(addr).spend(1)) { refuse(entry, 429, "registration rate"); return; }
   if (!(await accept(entry, key))) return;
-  const nonce = await random(NONCE_LEN);
-  if (entry.closed) return;
-  entry.conn = new ControlConn(entry, addr, authority, target.rooms, nonce);
+  entry.conn = new ControlConn(entry, addr);
   // A client may send its first frame with the upgrade request.
   if (head.length > 0) await entry.conn.onData(head);
 }
@@ -1401,12 +1381,12 @@ const ops = {
     }
     if (answers.length > 0) void host.call(N_UDP_SEND, concatBytes(answers)).catch(() => {});
   },
-  /** `start [authority text]*`: the names the relay also answers to, which its runner
-   *  knows once the port is bound. Answers the STUN ports, `[port u16]*`. */
-  async start(r) {
-    while (r.more()) authorities.add(canonicalAuthority(utf8Decode(r.blob())));
+  /** `start`: answers the contact secret a relay link presents and then the STUN ports,
+   *  `[len u8][secret len][port u16]*`, the secret empty for an open relay. */
+  async start() {
     const ports = await start();
-    return concatBytes(ports.map((p) => of(p >> 8, p & 255)));
+    const secret = openRelay ? EMPTY : (await acceptSecrets())[0];
+    return concatBytes([of(secret.length), secret, ...ports.map((p) => of(p >> 8, p & 255))]);
   },
   /** Tell every socket the relay is restarting. */
   close() { closeAll(); },
@@ -1423,4 +1403,3 @@ function handle(argBytes) {
   return out instanceof Promise ? out.then((v) => v ?? EMPTY) : out ?? EMPTY;
 }
 
-/* @seedkernel-op-frame */

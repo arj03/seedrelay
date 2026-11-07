@@ -1,25 +1,25 @@
 // The relay bundle's guest program, as relay.skb carries it, in a realm of its own behind a
 // host that stands in for seedkernel's: links that record what the relay writes, a clock
-// the test moves, and the host calls the relay makes (`node/verify` under the link scope,
-// BLAKE2b, entropy, and the ws module's masking and accept value). Slow readers, exact
+// the test moves, and the host calls the relay makes (`node/sign` and `node/verify` under
+// the link scope with the relay's own key, BLAKE2b, ChaCha20-Poly1305, X25519, entropy,
+// the ML-KEM module, and the ws module's masking and accept value). Slow readers, exact
 // budget boundaries and timeouts are deterministic this way; test/relay.test.mjs also runs
 // the bin over real sockets.
 
 import vm from "node:vm";
 import { readFileSync } from "node:fs";
-import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
-import { loadCrypto } from "seedkernel-wasm";
+import { createHash, randomBytes } from "node:crypto";
 import { verifyBundle } from "seedkernel-wasm/bundle";
+import { DOMAIN_LINK_SCOPE, mlkem, sodium } from "./channel.mjs";
 import { OpArgs } from "seedkernel-wasm/op-frame";
 import { DEFAULT_LIMITS, parseOptions, RELAY_BUNDLE, relayConfig } from "../relay.mjs";
 
 const ZERO32 = new Uint8Array(32);
-const DOMAIN_LINK_SCOPE = Buffer.from("seedkernel-link-scope-v1\0");
-const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
+const CONTACT_TAG = Buffer.from("seedkernel-contact-secret-v1\0");
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const u32 = (v) => Buffer.from([v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
 const settle = () => new Promise((r) => setImmediate(r));
-const { guestSource: source, manifest } = verifyBundle(await loadCrypto(), readFileSync(RELAY_BUNDLE));
+const { guestSource: source, manifest } = verifyBundle(sodium, readFileSync(RELAY_BUNDLE));
 
 /** What seedkernel's ws.wasm answers: a frame masked under the key its header carries, or
  *  the accept value for a key. */
@@ -54,13 +54,17 @@ class Link {
   }
 }
 
-/** A relay started with `args` on the command line, answering to relay.test unless they
- *  name its authorities. */
+/** A relay started with `args` on the command line. */
 export async function relayRealm(args = []) {
   const options = parseOptions(args);
-  if (options.authorities.length === 0) options.authorities.push("relay.test");
   const logs = [], links = new Map(), sent = [];
   let now = 0, wakeAt = Infinity, nextId = 0, nextSocket = 0;
+  const id = sodium.crypto_sign_keypair();
+  /** `[npub 12][key 32][adLen u32][ad][msg]`, as seedkernel's guest seam reads it. */
+  const aead = (a) => {
+    const adLen = a.readUInt32BE(44);
+    return { npub: a.subarray(0, 12), key: a.subarray(12, 44), ad: adLen ? a.subarray(48, 48 + adLen) : null, msg: a.subarray(48 + adLen) };
+  };
   const answer = (bytes) => Promise.resolve(new Uint8Array(bytes));
   const calls = {
     "link/send": (a) => {
@@ -84,11 +88,23 @@ export async function relayRealm(args = []) {
     "link/udpBind": (a) => answer(Buffer.concat([u32(++nextSocket), a.subarray(0, 2)])),
     "link/udpSend": (a) => { sent.push(Buffer.from(a)); return answer([]); },
     "timer/arm": (a) => { wakeAt = now + a.readUInt32BE(0); return answer([]); },
-    "node/verify": (a) => {
-      const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, a.subarray(0, 32)]), format: "der", type: "spki" });
-      return answer([verify(null, Buffer.concat([DOMAIN_LINK_SCOPE, a.subarray(96)]), key, a.subarray(32, 96)) ? 1 : 0]);
+    "node/sign": (a) => answer(sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, a]), id.privateKey)),
+    "node/verify": (a) => answer([sodium.crypto_sign_verify_detached(a.subarray(32, 96), Buffer.concat([DOMAIN_LINK_SCOPE, a.subarray(96)]), a.subarray(0, 32)) ? 1 : 0]),
+    "crypto/blake2b": (a) => answer(sodium.crypto_generichash(a[0], a.subarray(2 + a[1]), a[1] ? a.subarray(2, 2 + a[1]) : null)),
+    "crypto/chacha20poly1305-ietf/seal": (a) => {
+      const { npub, key, ad, msg } = aead(a);
+      return answer(sodium.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key));
     },
-    "crypto/blake2b": (a) => answer(createHash("blake2b512").update(a.subarray(2 + a[1])).digest()),
+    "crypto/chacha20poly1305-ietf/open": (a) => {
+      const { npub, key, ad, msg } = aead(a);
+      try { return answer(Buffer.concat([Buffer.of(1), sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, msg, ad, npub, key)])); }
+      catch { return answer([0]); }
+    },
+    "crypto/x25519/dh": (a) => {
+      try { return answer(Buffer.concat([Buffer.of(1), sodium.crypto_scalarmult(a.subarray(0, 32), a.subarray(32, 64))])); }
+      catch { return answer([0]); }
+    },
+    mlkem: (a) => mlkem(a),
     "crypto/random": (a) => answer(randomBytes(a.readUInt32BE(0))),
     ws: (a) => answer(wsModule(a)),
   };
@@ -98,10 +114,18 @@ export async function relayRealm(args = []) {
     performance: { now: () => now },
     host: { call: (name, bytes) => calls[name](Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)) },
   });
-  vm.runInContext(preamble("HOST", {}) + preamble("APP", manifest.guest.config) + preamble("LOCAL", relayConfig(options)) + source, context);
+  vm.runInContext(preamble("HOST", { identity: Buffer.from(id.publicKey).toString("hex") }) + preamble("APP", manifest.guest.config) + preamble("LOCAL", relayConfig(options)) + source, context);
 
   const relay = {
     logs, links, sent,
+    /** The relay's key, which a relay link is pinned to. */
+    pk: Buffer.from(id.publicKey),
+    /** The contact secret a node presents, hex, as its URL carries it: the operator's
+     *  first, or the one the relay derives from its key, a hash of its signature over a
+     *  fixed tag (seedkernel's `keySecret`), worked out here apart from the guest; null
+     *  for an open relay. */
+    secret: options.open ? null : options.secrets[0] ?? Buffer.from(sodium.crypto_generichash(32,
+      Buffer.concat([CONTACT_TAG, sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, CONTACT_TAG]), id.privateKey)]), null)).toString("hex"),
     /** Hand the relay one event from the host, and let everything it set off finish. */
     async event(args) {
       await context.handle(args.build(ZERO32));

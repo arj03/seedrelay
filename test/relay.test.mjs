@@ -1,21 +1,36 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { request } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { setTimeout as sleep } from "node:timers/promises";
-import { localAuthorities, parseOptions } from "../relay.mjs";
+import { bootShell } from "seedkernel-wasm/shell-core";
+import { nodeChannels } from "seedkernel-wasm/shell-node";
+import { transportBundleBytes } from "seedkernel-wasm/transport-bundle";
+import { OpArgs } from "seedkernel-wasm/op-frame";
+import { parseOptions } from "../relay.mjs";
 import { roomClient } from "../rooms.mjs";
 import { relayRealm } from "./harness.mjs";
+import { identity, relayLink, sodium } from "./channel.mjs";
 
 const SERVER = fileURLToPath(new URL("../server.mjs", import.meta.url));
 const WS_KEY = "AAAAAAAAAAAAAAAAAAAAAA==";
+const SECRET = "11".repeat(32), OTHER_SECRET = "22".repeat(32);
 
-/** A relay (test/harness.mjs) answering to relay.test unless `args` name its authorities,
- *  with the sockets the tests open on it. */
+/** Resolves once `pred()` holds, or throws after `ms`: the relay answers a msg1 only once
+ *  the ML-KEM module has, which is real time, not the harness clock. */
+async function waitFor(pred, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error("waitFor: timed out");
+    await sleep(2);
+  }
+}
+
+/** A relay (test/harness.mjs) with the sockets the tests open on it. */
 async function fixture(args = []) {
   const relay = await relayRealm(args);
   async function upgrade(s, { path = "/v1/", headers = {}, head } = {}) {
@@ -29,30 +44,53 @@ async function fixture(args = []) {
     return s;
   }
   const join = async (options, address) => upgrade(await relay.tcp(address), options);
-  /** A control socket that has registered `id` (a fresh one by default), proving `secret`
+  /** Run the handshake on relay link `s` as `id`, pinned to `pk` (the relay's by default)
+   *  and presenting `secret` (hex; by default the one the relay's URL carries, none for an
+   *  open relay). Resolves true once registered; false when the relay never answered msg1,
+   *  or answered it as a key other than `pk`. */
+  async function register(s, id, secret, pk = relay.pk) {
+    const ch = await relayLink(id, pk, Buffer.from(secret ?? relay.secret ?? "00".repeat(32), "hex"));
+    s.id = id;
+    s.sent = [ch.msg1];
+    await s.data(frame(2, ch.msg1));
+    try { await waitFor(() => s.closed || binary(s).length > 0, 500); } catch { return false; }
+    const w3 = s.closed ? null : await ch.msg3(binary(s)[0]);
+    if (!w3) return false;
+    s.ch = ch;
+    s.opened = [];
+    s.sent.push(w3);
+    /** One record to the relay, kept in `sent` as it crossed. */
+    s.send = (pt) => {
+      const ct = ch.seal(pt);
+      s.sent.push(ct);
+      return s.data(frame(2, ct));
+    };
+    await s.data(frame(2, w3));
+    await waitFor(() => s.closed || typed(s).length > 0);
+    return typed(s)[0]?.[0] === 0x01;
+  }
+  /** A relay link that has registered `id` (a fresh one by default), presenting `secret`
    *  if given. */
   async function member({ secret, ...options } = {}, id = identity(), address) {
     const s = await join(options, address);
-    if (!s.closed) await s.data(frame(2, registration(id, "relay.test", challenge(s), secret)));
     s.id = id;
+    if (!s.closed) await register(s, id, secret);
     return s;
   }
-  /** A room socket that has registered `id` and joined `room`, or no room for null. */
-  async function roomMember({ room = "room", secret, ...options } = {}, id = identity(), address) {
-    const s = await join({ path: "/v1/rooms", ...options }, address);
-    if (!s.closed) await s.data(frame(2, roomRegistration(id, "relay.test", challenge(s), secret)));
-    if (room !== null && !s.closed) await s.data(joinRoom(room));
-    s.id = id;
+  /** A member that has joined `room`, or no room for null. */
+  async function roomMember({ room = "room", ...options } = {}, id = identity(), address) {
+    const s = await member(options, id, address);
+    if (room !== null && !s.closed) await s.send(joinRoom(room));
     return s;
   }
   /** Call `b` from `a` and open both ends of the splice: [the caller's, the callee's]. */
   async function splice(a, b, { callerAddress, calleeAddress } = {}) {
     const ticket = randomBytes(16);
-    await a.data(call(b.id.pk, ticket));
+    await a.send(call(b.id.pk, ticket));
     return [await join({ path: splicePath(ticket.toString("hex")) }, callerAddress),
       await join({ path: splicePath(calleeTicket(b)) }, calleeAddress)];
   }
-  return { relay, logs: relay.logs, tcp: relay.tcp, upgrade, join, member, roomMember, splice,
+  return { relay, logs: relay.logs, tcp: relay.tcp, upgrade, join, register, member, roomMember, splice,
     beat: relay.beat, advance: relay.advance };
 }
 /** A client frame: masked, as RFC 6455 requires. */
@@ -84,154 +122,111 @@ function parseFrames(bytes) {
 /** The server frames written to a socket after its 101 response. */
 const serverFrames = (sock) => parseFrames(Buffer.concat(sock.writes.slice(1))).frames;
 const status = (sock) => Number(/^HTTP\/1\.1 (\d+)/.exec(sock.writes[0]?.toString() ?? "")?.[1]);
-const typed = (sock) => serverFrames(sock).filter((f) => f.opcode === 2).map((f) => f.payload);
+const binary = (sock) => serverFrames(sock).filter((f) => f.opcode === 2).map((f) => f.payload);
+/** What the relay sent: on a registered relay link its records, each opened once and a
+ *  tell as the message inside it (rooms' types are none of the relay wire's); on any other
+ *  socket the binary payloads. */
+function typed(sock) {
+  if (!sock.ch) return binary(sock);
+  const frames = binary(sock).slice(1);
+  for (let i = sock.opened.length; i < frames.length; i++) {
+    const r = sock.ch.open(frames[i]);
+    sock.opened.push(r && r[0] === 0x08 ? r.subarray(1) : r);
+  }
+  return sock.opened;
+}
 const ofType = (sock, type) => typed(sock).filter((p) => p[0] === type);
-const challenge = (sock) => typed(sock)[0].subarray(1);
 const calleeTicket = (sock) => ofType(sock, 0x05).at(-1).subarray(33).toString("hex");
 const splicePath = (hex) => `/v1/?splice=${hex}`;
 const closeCode = (sock) => serverFrames(sock).filter((f) => f.opcode === 8).map((f) => f.payload.readUInt16BE(0)).at(-1);
 
-function identity() {
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  return { pk: publicKey.export({ format: "der", type: "spki" }).subarray(12), key: privateKey };
-}
-const DOMAINS = Buffer.from("seedkernel-link-scope-v1\0seedkernel-relay-register-v1\0");
-const ROOMS_DOMAIN = Buffer.from("seedkernel-link-scope-v1\0seedrelay-rooms-v1\0");
-/** A control socket's registration, with its MAC under `secret` when one is given. */
-function registration(id, authority, nonce, secret, domain = DOMAINS) {
-  const sig = sign(null, Buffer.concat([domain, Buffer.from(authority), nonce]), id.key);
-  return Buffer.concat([Buffer.of(1), id.pk, sig, secretMac(secret, id.pk, sig)]);
-}
-/** A room socket's registration, under the rooms tag. */
-const roomRegistration = (id, authority, nonce, secret) => registration(id, authority, nonce, secret, ROOMS_DOMAIN);
-/** BLAKE2b-512, unkeyed: what libsodium's `crypto_generichash(64, m)` and seedkernel's
- *  `crypto/blake2b` give. */
-const blake2b = (m) => createHash("blake2b512").update(m).digest();
-function secretMac(secret, pk, sig) {
-  if (secret === undefined) return Buffer.alloc(0);
-  return blake2b(Buffer.concat([Buffer.from("seedrelay-secret-v1\0"), pk, sig, Buffer.from(secret)]));
-}
-const call = (to, ticket) => frame(2, Buffer.concat([Buffer.of(5), to, ticket]));
+const call = (to, ticket) => Buffer.concat([Buffer.of(5), to, ticket]);
 /** A room's id, as a node would name it: any 32 bytes do. */
 const roomId = (name) => createHash("sha256").update(name).digest();
-const joinRoom = (name) => frame(2, Buffer.concat([Buffer.of(2), roomId(name)]));
-const leaveRoom = (name) => frame(2, Buffer.concat([Buffer.of(3), roomId(name)]));
-/** A members, joined or left frame's payload for `room`. */
+const joinRoom = (name) => Buffer.concat([Buffer.of(8, 2), roomId(name)]);
+const leaveRoom = (name) => Buffer.concat([Buffer.of(8, 3), roomId(name)]);
+/** A members, joined or left message for `room`. */
 const roomFrame = (type, room, ...pks) => Buffer.concat([Buffer.of(type), roomId(room), ...pks]);
 
-test("a node registers by signing the nonce for a name this relay answers to", async () => {
+test("a node registers by proving its key in the channel handshake, pinned to the relay's", async () => {
   const f = await fixture(), id = identity();
   const good = await f.join({ headers: { host: "Relay.Test:443" } });
   assert.equal(status(good), 101);
-  assert.equal(typed(good)[0][0], 0x00);
-  assert.equal(challenge(good).length, 32);
-  await good.data(frame(2, registration(id, "relay.test", challenge(good))));
-  assert.equal(good.closed, false);
-  assert.deepEqual([...typed(good)[1]], [0x01]);
+  assert.equal(serverFrames(good).length, 0, "the relay says nothing before a msg1");
+  assert.equal(await f.register(good, id), true);
+  assert.deepEqual([...typed(good)[0]], [0x01], "registered, in a record");
 
-  const replay = await f.join();
-  await replay.data(frame(2, registration(id, "relay.test", challenge(good))));
-  assert.equal(replay.destroyed, true, "a signature over another socket's nonce");
-  const elsewhere = await f.join();
-  await elsewhere.data(frame(2, registration(id, "other.test", challenge(elsewhere))));
-  assert.equal(elsewhere.destroyed, true, "a signature for another relay");
+  const posing = await f.join();
+  assert.equal(await f.register(posing, identity(), undefined, identity().pk), false,
+    "a relay that cannot sign as the pinned key is never told who calls");
+  const silent = await f.join();
+  await silent.data(frame(2, randomBytes(1233)));
+  assert.equal(binary(silent).length, 0, "a msg1 that does not open draws silence");
+  assert.equal(silent.closed, false, "and no close");
   const late = await f.join();
   await f.advance(10_000);
-  assert.equal(late.destroyed, true, "no registration in time");
-  const early = await f.join();
-  await early.data(call(id.pk, randomBytes(16)));
-  assert.equal(early.destroyed, true, "a call before registering");
+  assert.equal(late.destroyed && silent.destroyed, true, "no handshake in time");
 });
 
-test("a Host this relay does not answer to is refused, so no relay can pass another's nonce through", async () => {
-  // Relay A takes a nonce from B, has one of its own visitors sign it for a.test, and
-  // presents the signature to B as Host a.test.
-  const b = await fixture(["--authority", "b.test"]), visitor = identity();
-  const posing = await b.join({ headers: { host: "a.test" } });
-  assert.equal(posing.closed, true);
-  assert.equal(status(posing), 421);
-  assert.equal(posing.writes.length, 1, "it never gets a nonce");
-  assert.equal(status(await b.join({ headers: { host: undefined } })), 421, "nor does a socket with no Host");
-  const own = await b.join({ headers: { host: "B.test:80" } });
-  await own.data(frame(2, registration(visitor, "b.test", challenge(own))));
-  assert.equal(ofType(own, 0x01).length, 1, "registered");
-});
-
-test("a relay with a secret registers only nodes and apps that prove it, without it crossing the wire", async () => {
-  const secret = "correct horse battery", other = "another good secret";
-  const f = await fixture(["--secret", secret, "--secret", other, "--register-rate", "0"]);
-  for (const kind of ["control", "rooms"]) {
-    const enrol = kind === "control" ? f.member : (options) => f.roomMember({ room: null, ...options });
-    assert.equal((await enrol()).destroyed, true, `${kind}: no MAC`);
-    assert.equal((await enrol({ secret: "a wrong guess at it" })).destroyed, true, `${kind}: a MAC under another secret`);
-    assert.equal(ofType(await enrol({ secret }), 0x01).length, 1, `${kind}: registered`);
-    assert.equal(ofType(await enrol({ secret: other }), 0x01).length, 1, `${kind}: under either secret`);
+test("nothing a relay link carries names a key", async () => {
+  const f = await fixture();
+  const a = await f.roomMember(), b = await f.roomMember();
+  await a.send(call(b.id.pk, randomBytes(16)));
+  assert.equal(ofType(b, 0x05).length, 1, "a call crossed");
+  const wire = Buffer.concat([...a.writes, ...b.writes, ...a.sent, ...b.sent]);
+  for (const pk of [a.id.pk, b.id.pk, f.relay.pk]) {
+    assert.equal(wire.includes(pk), false, "no key in what either side put on the wire");
   }
-  assert.ok(f.logs.some((line) => line.includes("dropped: no secret")));
-  assert.equal(f.logs.join("\n").includes(secret), false);
+});
 
-  // A listener who saw a registration cannot move its MAC to another socket or key.
-  const seen = await f.join(), a = identity(), b = identity();
-  const heard = registration(a, "relay.test", challenge(seen), secret);
-  await seen.data(frame(2, heard));
-  const mac = heard.subarray(97);
-  const replay = await f.join();
-  await replay.data(frame(2, heard));
-  assert.equal(replay.destroyed, true, "the same registration on another socket");
-  const moved = await f.join();
-  await moved.data(frame(2, Buffer.concat([registration(b, "relay.test", challenge(moved)), mac])));
-  assert.equal(moved.destroyed, true, "the MAC with another key's signature");
-  const cut = await f.join();
-  await cut.data(frame(2, registration(a, "relay.test", challenge(cut), secret).subarray(0, 97 + 32)));
-  assert.equal(cut.destroyed, true, "a MAC cut to 32 bytes, as crypto_generichash(32, m) would give");
+test("a relay takes only nodes that hold the secret its URL carries, its key's own by default", async () => {
+  const f = await fixture(["--register-rate", "0"]);
+  assert.match(f.relay.secret, /^[0-9a-f]{64}$/);
+  const none = await f.member({ secret: "00".repeat(32) }), wrong = await f.member({ secret: "33".repeat(32) });
+  assert.equal(typed(none).length + typed(wrong).length, 0, "no secret, or another, draws silence");
+  assert.equal(ofType(await f.member(), 0x01).length, 1, "the relay's own registers");
+});
 
-  // The MAC is libsodium's BLAKE2b-512, as apps and the transport compute it: this vector
-  // is `crypto_generichash(64, "seedrelay-secret-v1\0" ‖ 0x11×32 ‖ 0x22×64 ‖ secret)`.
-  assert.equal(secretMac(secret, Buffer.alloc(32, 0x11), Buffer.alloc(64, 0x22)).toString("hex"),
-    "33fbb32be9fe6c16946bb35d6a343126de9c4858062f94037611f733156de4ed" +
-    "34753a899a7d808ad10f57f56307a96496c9918fb81da06ff14aa96de5cd5785");
+test("an open relay takes any node, and a relay with --open takes no secret", async () => {
+  const f = await fixture(["--open"]);
+  assert.equal(f.relay.secret, null);
+  assert.equal(ofType(await f.member({ secret: "00".repeat(32) }), 0x01).length, 1, "a node with no secret registers");
+  assert.throws(() => parseOptions(["--open", "--secret", SECRET]), /--open takes no --secret/);
+});
 
-  // Splice sockets need only their tickets, which only registered sockets are given.
-  const caller = await f.member({ secret }), callee = await f.member({ secret });
+test("a relay with secrets registers only nodes that hold one, which never crosses the wire", async () => {
+  const f = await fixture(["--secret", SECRET, "--secret", OTHER_SECRET, "--register-rate", "0"]);
+  const none = await f.member({ secret: "00".repeat(32) }), wrong = await f.member({ secret: "33".repeat(32) });
+  assert.equal(typed(none).length + typed(wrong).length, 0, "no secret, or another, draws silence");
+  assert.equal(ofType(await f.member({ secret: SECRET }), 0x01).length, 1, "registered");
+  assert.equal(ofType(await f.member({ secret: OTHER_SECRET }), 0x01).length, 1, "under either secret");
+  assert.equal(f.logs.join("\n").includes(SECRET), false);
+  // Splice sockets need only their tickets, which only registered links are given.
+  const caller = await f.member({ secret: SECRET }), callee = await f.member({ secret: SECRET });
   const [sa, sb] = await f.splice(caller, callee);
   await sa.data(frame(2, Buffer.from("through")));
   assert.deepEqual(typed(sb).at(-1), Buffer.from("through"));
 
-  const open = await fixture(), given = await open.member({ secret });
-  assert.equal(ofType(given, 0x01).length, 1, "a relay with no secret ignores a MAC");
-  assert.throws(() => parseOptions(["--secret", "too short"]), /at least 16/);
-  for (const unread of [`${secret},${other}`, ` ${secret}`, `${secret}\n`]) {
-    assert.throws(() => parseOptions(["--secret", unread]), /no commas/, "as RELAY_SECRETS or a file could not give it");
+  for (const bad of ["too short", "zz".repeat(32), `${SECRET},${OTHER_SECRET}`]) {
+    assert.throws(() => parseOptions(["--secret", bad]), /64 hex/, bad);
   }
-  assert.deepEqual(parseOptions([], { RELAY_SECRETS: `${secret}, ${other}` }).secrets, [secret, other]);
-});
-
-test("with no --authority a relay answers to the names of the address it is bound to, if it has one", () => {
-  assert.deepEqual(localAuthorities("127.0.0.1", 8080), ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"]);
-  assert.deepEqual(localAuthorities("192.0.2.1", 80), ["192.0.2.1"]);
-  assert.deepEqual(localAuthorities("2001:db8::1", 8443), ["[2001:db8::1]:8443"]);
+  assert.deepEqual(parseOptions([], { RELAY_SECRETS: `${SECRET}, ${OTHER_SECRET.toUpperCase()}` }).secrets, [SECRET, OTHER_SECRET]);
 });
 
 test("malformed or unknown options fail at startup instead of falling back", () => {
   for (const args of [["--max-conns", "lots"], ["--max-conns", "-1"], ["--max-conns", "1.5"], ["--max-conns"],
     ["--ipv6-prefix", "129"], ["--port", "70000"], ["--max-per-room", "1025"], ["--frobnicate"], ["--trust-proxy"],
-    ["--trusted-proxy", "bogus"], ["--authority", "wss://relay.example"]]) {
+    ["--trusted-proxy", "bogus"], ["--authority", "relay.example"]]) {
     assert.throws(() => parseOptions(args), Error, args.join(" "));
   }
   assert.throws(() => parseOptions([], { RELAY_MAX_CONNS: "many" }), /RELAY_MAX_CONNS/);
-  const o = parseOptions(["9000", "--splice-rate", "0.5", "--authority", "Relay.Example:443"], { RELAY_MAX_CONNS: "10" });
+  const o = parseOptions(["9000", "--splice-rate", "0.5"], { RELAY_MAX_CONNS: "10" });
   assert.equal(o.port, 9000);
   assert.equal(o.limits.spliceRate, 0.5);
   assert.equal(o.limits.maxConns, 10);
-  assert.deepEqual(o.authorities, ["relay.example"]);
-  assert.throws(() => parseOptions(["--host", "0.0.0.0"]), /--authority/, "a wildcard bind has no name of its own");
-  for (const h of ["", "::0", "[::]", "0:0:0:0:0:0:0:0", "0000::"]) {
-    assert.throws(() => parseOptions(["--host", h]), /--authority/, `wildcard ${JSON.stringify(h)}`);
-  }
-  assert.equal(parseOptions(["--host", "", "--authority", "relay.lan:8080"]).host, "");
+  assert.equal(parseOptions(["--host", ""]).host, "", "every interface");
   assert.equal(parseOptions(["--host", "[::1]"]).host, "::1", "a host loses its URL brackets");
-  assert.deepEqual(localAuthorities("::1", 8080), ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"]);
-  assert.equal(parseOptions(["--host", "::", "--authority", "relay.lan:8080"]).host, "::");
+  assert.equal(parseOptions(["--host", "::"]).host, "::");
   for (const args of [["--register-rate", " "], ["--splice-rate", " "], ["--heartbeat-secs", " "], ["--port", " "]]) {
     assert.throws(() => parseOptions(args), Error, `whitespace ${args.join(" ")}`);
   }
@@ -241,8 +236,9 @@ test("malformed or unknown options fail at startup instead of falling back", () 
   for (const value of ["", "   ", ",,,"]) {
     assert.throws(() => parseOptions([], { RELAY_SECRETS: value }), /RELAY_SECRETS/);
   }
-  assert.deepEqual(parseOptions(["--secret", "correct horse battery"], { RELAY_SECRETS: "" }).secrets,
-    ["correct horse battery"], "a --secret flag can supply what an empty variable did not");
+  assert.deepEqual(parseOptions(["--secret", SECRET], { RELAY_SECRETS: "" }).secrets,
+    [SECRET], "a --secret flag can supply what an empty variable did not");
+  assert.equal(parseOptions(["--key", "relay-id.key"]).key, "relay-id.key");
   assert.equal(parseOptions([]).stun, 3478, "on by default");
   assert.equal(parseOptions(["--stun", "4000"]).stun, 4000);
   assert.equal(parseOptions(["--stun", "off"]).stun, null);
@@ -264,13 +260,12 @@ test("--print-config gives a native node the settings the flags make", () => {
   const out = spawnSync(process.execPath, [SERVER, "9000", "--max-conns", "10", "--stun", "off", "--print-config"],
     { encoding: "utf8", windowsHide: true });
   assert.equal(out.status, 0, out.stderr);
-  assert.deepEqual(JSON.parse(out.stdout), { limits: { maxConns: 10 }, authorities: ["localhost:9000", "127.0.0.1:9000", "[::1]:9000"],
-    trustedProxies: [], secrets: [], stun: null });
+  assert.deepEqual(JSON.parse(out.stdout), { limits: { maxConns: 10 }, trustedProxies: [], secrets: [], open: false, stun: null });
 });
 
 test("a path outside the wire version this relay speaks is refused", async () => {
   const f = await fixture();
-  for (const path of ["/", "/room", "/v2/", "/v1/room", "/v1x", `/?splice=${"00".repeat(16)}`]) {
+  for (const path of ["/", "/room", "/v2/", "/v1/room", "/v1/rooms", "/v1x", `/?splice=${"00".repeat(16)}`]) {
     const s = await f.join({ path });
     assert.equal(s.closed, true, path);
     assert.equal(status(s), 404, path);
@@ -297,15 +292,20 @@ test("a plain HTTP request is told to upgrade, and a malformed one is refused", 
   assert.equal(slow.destroyed, true, "a head that never ends is given up on");
 });
 
-test("text frames, unknown types and a second registration drop the sender", async () => {
-  for (const bytes of [frame(1, Buffer.from("hi")), frame(2, Buffer.of(9)), frame(2, Buffer.alloc(0)), joinRoom("room")]) {
+test("text frames drop a relay link, and so do records the wire has no use for", async () => {
+  for (const bytes of [frame(1, Buffer.from("hi")), frame(2, Buffer.alloc(0))]) {
     const f = await fixture(), s = await f.join();
     await s.data(bytes);
-    assert.equal(s.destroyed, true, bytes.toString("hex"));
+    if (bytes[0] === 0x81) assert.equal(s.destroyed, true, "a text frame");
+  }
+  for (const record of [Buffer.of(9), Buffer.of(5, 1, 2), Buffer.concat([Buffer.of(8, 9), roomId("room")])]) {
+    const f = await fixture(), s = await f.member();
+    await s.send(record);
+    assert.equal(s.destroyed, true, record.toString("hex"));
   }
   const f = await fixture(), s = await f.member();
-  await s.data(frame(2, registration(s.id, "relay.test", challenge(s))));
-  assert.equal(s.destroyed, true);
+  await s.data(frame(2, randomBytes(64)));
+  assert.equal(s.destroyed, true, "a record that does not open");
 });
 
 test("a room's members are the keys joined to it, announced as they join and leave", async () => {
@@ -314,45 +314,45 @@ test("a room's members are the keys joined to it, announced as they join and lea
   const roomless = await f.roomMember({ room: null });
   assert.deepEqual(typed(b).at(-1), roomFrame(0x02, "room", a.id.pk), "the newcomer gets the room");
   assert.deepEqual(typed(a).at(-1), roomFrame(0x03, "room", b.id.pk), "the room gets the newcomer");
-  assert.equal(typed(outsider).length, 3, "another room hears nothing");
-  assert.equal(typed(roomless).length, 2, "a socket in no room gets no members");
+  assert.equal(typed(outsider).length, 2, "another room hears nothing");
+  assert.equal(typed(roomless).length, 1, "a link in no room gets no members");
   const heard = typed(a).length;
   const b2 = await f.roomMember({}, b.id);
-  assert.equal(typed(a).length, heard, "a second socket for the same key is not a new member");
+  assert.equal(typed(a).length, heard, "a second link for the same key is not a new member");
   await b.destroy();
   assert.equal(typed(a).length, heard, "the key is still in the room");
   await b2.destroy();
   assert.deepEqual(typed(a).at(-1), roomFrame(0x04, "room", b.id.pk));
 });
 
-test("rooms and calls take separate sockets, so an app's rooms never draw a node's calls", async () => {
-  const f = await fixture(), node = await f.member(), app = await f.roomMember({ room: null });
-  await node.data(joinRoom("room"));
-  assert.equal(node.destroyed, true, "a control socket joins no room");
-  await app.data(call((await f.member()).id.pk, randomBytes(16)));
-  assert.equal(app.destroyed, true, "a room socket places no call");
-  const roomsOnly = await f.roomMember(), caller = await f.member();
-  await caller.data(call(roomsOnly.id.pk, randomBytes(16)));
-  assert.equal(typed(caller).at(-1)[0], 0x06, "a key on a room socket only cannot be called");
-  const id = identity(), control = await f.join();
-  await control.data(frame(2, roomRegistration(id, "relay.test", challenge(control))));
-  assert.equal(control.destroyed, true, "a room signature does not register a control socket");
-  const rooms = await f.join({ path: "/v1/rooms" });
-  await rooms.data(frame(2, registration(id, "relay.test", challenge(rooms))));
-  assert.equal(rooms.destroyed, true, "nor a control signature a room socket");
+test("a full room's members reach its newest member in one record, past the cap on what a node sends", async () => {
+  const n = 70; // a members record of 70 keys is over 2 KiB
+  const f = await fixture(["--max-per-room", String(n)]);
+  const seated = [];
+  for (let i = 1; i < n; i++) seated.push(await f.roomMember({}, identity(), `192.0.2.${i}`));
+  const last = await f.roomMember({}, identity(), "198.51.100.1");
+  assert.deepEqual(typed(last).at(-1), roomFrame(0x02, "room", ...seated.map((s) => s.id.pk)));
+  assert.equal(last.closed, false);
+});
+
+test("rooms and calls share a node's one relay link", async () => {
+  const f = await fixture(), a = await f.roomMember(), b = await f.roomMember();
+  await a.send(call(b.id.pk, randomBytes(16)));
+  assert.equal(ofType(b, 0x05).length, 1, "a key in a room is called on the link it joined on");
+  assert.deepEqual(ofType(b, 0x02).at(-1), roomFrame(0x02, "room", a.id.pk), "and hears its room there");
 });
 
 test("one socket joins and leaves several rooms", async () => {
   const f = await fixture(), a = await f.roomMember(), b = await f.roomMember({ room: "other" });
-  await a.data(joinRoom("other"));
+  await a.send(joinRoom("other"));
   assert.deepEqual(typed(a).at(-1), roomFrame(0x02, "other", b.id.pk), "a second room's members");
   assert.deepEqual(typed(b).at(-1), roomFrame(0x03, "other", a.id.pk));
-  await a.data(joinRoom("other"));
+  await a.send(joinRoom("other"));
   assert.deepEqual(typed(a).at(-1), roomFrame(0x02, "other", b.id.pk), "joining again is nothing new");
-  await a.data(leaveRoom("other"));
+  await a.send(leaveRoom("other"));
   assert.deepEqual(typed(b).at(-1), roomFrame(0x04, "other", a.id.pk));
   assert.equal(a.closed, false);
-  for (let i = 0; i < 16; i++) await a.data(joinRoom(`r${i}`));
+  for (let i = 0; i < 16; i++) await a.send(joinRoom(`r${i}`));
   assert.deepEqual(typed(a).at(-1), roomFrame(0x07, "r15"), "a seventeenth room is refused");
   assert.equal(a.closed, false, "and only the join");
 });
@@ -361,7 +361,7 @@ test("a call rings only the callee, with a ticket of its own, and joins the two 
   const f = await fixture();
   const a = await f.member(), b = await f.member(), c = await f.member();
   const ticket = randomBytes(16), hex = ticket.toString("hex");
-  await a.data(call(b.id.pk, ticket));
+  await a.send(call(b.id.pk, ticket));
   const ring = ofType(b, 0x05).at(-1);
   assert.deepEqual(ring.subarray(0, 33), Buffer.concat([Buffer.of(0x05), a.id.pk]));
   assert.equal(ring.length, 49);
@@ -384,16 +384,16 @@ test("a call rings only the callee, with a ticket of its own, and joins the two 
 test("an unknown callee, the caller's own key or a reused ticket is unreachable at once", async () => {
   const f = await fixture();
   const a = await f.member(), b = await f.member(), ticket = randomBytes(16);
-  await a.data(call(identity().pk, ticket));
+  await a.send(call(identity().pk, ticket));
   assert.equal(typed(a).at(-1)[0], 0x06);
-  await a.data(call(a.id.pk, ticket));
+  await a.send(call(a.id.pk, ticket));
   assert.equal(typed(a).at(-1)[0], 0x06, "a node cannot call itself");
   const a2 = await f.member({}, a.id);
-  await a.data(call(a.id.pk, ticket));
+  await a.send(call(a.id.pk, ticket));
   assert.equal(typed(a).at(-1)[0], 0x06, "nor its own key on another socket");
   assert.equal(ofType(a2, 0x05).length, 0);
-  await a.data(call(b.id.pk, ticket));
-  await a.data(call(b.id.pk, ticket));
+  await a.send(call(b.id.pk, ticket));
+  await a.send(call(b.id.pk, ticket));
   assert.deepEqual(typed(a).at(-1), Buffer.concat([Buffer.of(0x06), b.id.pk, ticket]));
   assert.equal(a.closed, false);
 });
@@ -401,10 +401,10 @@ test("an unknown callee, the caller's own key or a reused ticket is unreachable 
 test("the latest registration of a key takes its calls, and the one before takes over", async () => {
   const f = await fixture(), id = identity(), a = await f.member();
   const old = await f.member({}, id), latest = await f.member({}, id);
-  await a.data(call(id.pk, randomBytes(16)));
+  await a.send(call(id.pk, randomBytes(16)));
   assert.equal(typed(latest).at(-1)[0], 0x05);
   await latest.destroy();
-  await a.data(call(id.pk, randomBytes(16)));
+  await a.send(call(id.pk, randomBytes(16)));
   assert.equal(typed(old).at(-1)[0], 0x05);
 });
 
@@ -437,7 +437,7 @@ test("one end closing ends the other, and an unjoined call expires", async () =>
   const f = await fixture(), a = await f.member(), b = await f.member();
   const [sa, sb] = await f.splice(a, b);
   const t2 = randomBytes(16);
-  await a.data(call(b.id.pk, t2));
+  await a.send(call(b.id.pk, t2));
   await sa.destroy();
   assert.equal(sb.ended, true);
   await f.advance(10_000);
@@ -447,28 +447,28 @@ test("one end closing ends the other, and an unjoined call expires", async () =>
 test("calls are charged to the caller's address: a room's worth waiting, eight splices to a key", async () => {
   const f = await fixture(), a = await f.member(), b = await f.member();
   const rings = () => ofType(b, 0x05).length;
-  for (let i = 0; i < 9; i++) await a.data(call(b.id.pk, randomBytes(16)));
+  for (let i = 0; i < 9; i++) await a.send(call(b.id.pk, randomBytes(16)));
   assert.equal(rings(), 8);
   assert.equal(typed(a).at(-1)[0], 0x06, "a ninth call to one key from one address is unreachable");
-  await (await f.member({}, identity(), "192.0.2.7")).data(call(b.id.pk, randomBytes(16)));
+  await (await f.member({}, identity(), "192.0.2.7")).send(call(b.id.pk, randomBytes(16)));
   assert.equal(rings(), 9, "another address still gets through");
 
   const g = await fixture(), c = await g.member(), d = await g.member();
   const splices = [];
   for (let i = 0; i < 8; i++) splices.push(await g.splice(c, d));
-  await c.data(call(d.id.pk, randomBytes(16)));
+  await c.send(call(d.id.pk, randomBytes(16)));
   assert.equal(typed(c).at(-1)[0], 0x06, "joined splices count as waiting calls do");
   for (const end of splices[0]) await end.destroy();
-  await c.data(call(d.id.pk, randomBytes(16)));
+  await c.send(call(d.id.pk, randomBytes(16)));
   assert.equal(ofType(d, 0x05).length, 9, "a splice both ends have left is given back");
 
   const h = await fixture(["--max-per-room", "2"]), e = await h.member(), k = await h.member(), m = await h.member();
-  await e.data(call(k.id.pk, randomBytes(16)));
-  await m.data(call(k.id.pk, randomBytes(16)));
-  await e.data(call(m.id.pk, randomBytes(16)));
+  await e.send(call(k.id.pk, randomBytes(16)));
+  await m.send(call(k.id.pk, randomBytes(16)));
+  await e.send(call(m.id.pk, randomBytes(16)));
   assert.equal(typed(e).at(-1)[0], 0x06, "the address has a room's worth of calls waiting, over all its sockets");
   await h.advance(10_000);
-  await e.data(call(m.id.pk, randomBytes(16)));
+  await e.send(call(m.id.pk, randomBytes(16)));
   assert.equal(typed(m).at(-1)[0], 0x05, "calls that expired are given back");
 });
 
@@ -608,7 +608,7 @@ test("a sender paused by its splice-rate debt is not reaped by the heartbeat", a
 });
 
 test("invalid control sizes, RSV, fragmentation, masking and lengths are rejected", async () => {
-  const invalid = [frame(9, Buffer.alloc(126)), frame(10, Buffer.alloc(65535)), frame(2, Buffer.alloc(300)),
+  const invalid = [frame(9, Buffer.alloc(126)), frame(10, Buffer.alloc(65535)), frame(2, Buffer.alloc(3000)),
     Buffer.from([0xc1, 0x80, 0, 0, 0, 0]), Buffer.from([0x01, 0x80, 0, 0, 0, 0]),
     Buffer.from([0x82, 0]), Buffer.from([0x82, 0xfe, 0, 1, 0, 0, 0, 0, 65]),
     Buffer.from([0x82, 0xff, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 65])];
@@ -642,7 +642,7 @@ test("pong, announcement and heartbeat writes respect the backlog cap", async ()
   assert.equal(s.writes.at(-1).toString("hex"), "8a0470696e67");
   const t = await f.roomMember({ room: null });
   t.backlog = 256 * 1024 - 1;
-  await t.data(joinRoom("lonely"));
+  await t.send(joinRoom("lonely"));
   assert.equal(t.destroyed, true);
   const u = await f.roomMember({ room: "lonely" });
   assert.deepEqual(typed(u).at(-1), roomFrame(0x02, "lonely"), "a join it could not answer leaves no one behind");
@@ -720,7 +720,7 @@ test("TCP caps cover incomplete handshakes and release slots on close", async ()
   const third = await f.tcp("192.0.2.3");
   assert.equal(third.closed, false);
   await f.upgrade(third);
-  await third.data(frame(2, registration(identity(), "relay.test", challenge(third))));
+  assert.equal(await f.register(third, identity()), true);
   await f.advance(10_000);
   assert.equal(second.destroyed, true);
   assert.equal(third.closed, false);
@@ -749,14 +749,14 @@ test("an address joins rooms at the registration rate, so leaving and joining ag
   const f = await fixture(["--register-rate", "1"]);
   const app = await f.roomMember({ room: null }), seated = await f.roomMember({}, identity(), "192.0.2.7");
   for (let i = 0; i < 40; i++) {
-    await app.data(joinRoom("room"));
-    await app.data(leaveRoom("room"));
+    await app.send(joinRoom("room"));
+    await app.send(leaveRoom("room"));
   }
   assert.equal(ofType(seated, 0x03).length, 32, "two sockets' worth of rooms at once");
   assert.equal(ofType(app, 0x07).length, 8, "then each join past it is refused");
   assert.equal(app.closed, false, "and only the join");
   await f.advance(1000);
-  await app.data(joinRoom("room"));
+  await app.send(joinRoom("room"));
   assert.equal(ofType(seated, 0x03).length, 33, "and the rate refills");
 });
 
@@ -785,18 +785,19 @@ test("room ids, keys and request headers never appear in event logs", async () =
   assert.equal(logs.includes(s.id.pk.toString("hex")), false);
 });
 
-test("a registration split across the upgrade head and later reads is accepted", async () => {
+test("a msg1 split across the upgrade head and later reads is answered", async () => {
   const f = await fixture(), id = identity();
-  const s = await f.join();
-  const packet = frame(2, registration(id, "relay.test", challenge(s)));
-  await s.data(packet.subarray(0, 3));
+  const ch = await relayLink(id, f.relay.pk, Buffer.from(f.relay.secret, "hex"));
+  const packet = frame(2, ch.msg1);
+  const s = await f.join({ head: packet.subarray(0, 3) });
   await s.data(packet.subarray(3));
-  assert.equal(typed(s)[1][0], 0x01);
+  await waitFor(() => binary(s).length > 0);
+  assert.ok(await ch.msg3(binary(s)[0]), "the relay's msg2 verifies under its key");
 });
 
 /** Run the bin on a free port with `args` and `env`, and none of this shell's RELAY_
  *  variables, until its banner is out and it has printed each of `more`: what it printed,
- *  and the port it listens on. */
+ *  the port it listens on, and its URL. */
 async function startRelay(t, args = [], env = {}, ...more) {
   const clean = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("RELAY_")));
   // STUN off unless asked for, so relays started one after another never race for 3478.
@@ -813,64 +814,52 @@ async function startRelay(t, args = [], env = {}, ...more) {
     child.once("error", reject);
     child.once("exit", (code) => reject(new Error(`server exited ${code}`)));
   });
-  return { output, port: Number(/listening on ws:\/\/127\.0\.0\.1:(\d+)\/v1\//.exec(output)[1]) };
+  const [url, port] = /listening on (ws:\/\/[0-9a-f]{64}(?:\.[0-9a-f]{64})?@127\.0\.0\.1:(\d+))/.exec(output).slice(1);
+  return { output, port: Number(port), url };
 }
 
-/** A WebSocket upgrade request to `path` on `host`:`port`. */
-const upgradeRequest = (host, port, path) => request({ host, port, path, headers: {
-  Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": WS_KEY,
-} });
-
-/** A rooms.mjs client of the relay on `port` as `id`, closed when `t` ends. */
-function roomClientFor(t, port, id, options) {
-  const c = roomClient({ relay: `ws://127.0.0.1:${port}`, publicKey: id.pk, sign: (m) => sign(null, m, id.key),
-    WebSocket: TestWebSocket, ...options });
-  t.after(() => c.close());
-  return c;
+/** A seedkernel node on real sockets, with the shipped transport, closed when `t` ends:
+ *  `net(op)` calls its transport, and every status it says is handed to `onStatus`. */
+async function node(t) {
+  const id = sodium.crypto_sign_keypair(), n = { id, key: Buffer.from(id.publicKey).toString("hex"), statuses: [] };
+  const { shell } = await bootShell({ sodium, identity: id, services: { transport: {
+    bundle: transportBundleBytes(), channels: nodeChannels(), suppressLinkLog: true,
+    onStatus: (s) => { n.statuses.push(s); n.onStatus?.(s); },
+  } } });
+  t.after(() => shell.close());
+  n.net = (op) => shell.call("_net", op.build());
+  n.relay = async (url) => (await n.net(new OpArgs("relay").text(url)))[0];
+  return n;
 }
 
-/** Resolves once `pred()` holds. */
-async function waitFor(pred) {
-  while (!pred()) await sleep(10);
+/** A rooms.mjs client on node `n`, wired to its transport as an embedder wires it. */
+function roomsOn(n, onMember) {
+  const client = roomClient({ tell: async (bytes) => (await n.net(new OpArgs("tell").blob(bytes)))[0] === 1, onMember });
+  n.onStatus = (s) => client.status(s);
+  return client;
 }
 
-test("real sockets: register, call and splice through a running relay", { timeout: 20000 }, async (t) => {
-  const { output, port } = await startRelay(t, ["--stun", "0"], {}, /STUN on udp port/);
+test("real sockets: nodes register, meet in a room and link through a running relay", { timeout: 30000 }, async (t) => {
+  const { output, url } = await startRelay(t, ["--stun", "0"], {}, /STUN on udp port/);
   const stunPort = Number(/STUN on udp port (\d+)/.exec(output)[1]);
-  const open = (path) => new Promise((resolve, reject) => {
-    const req = upgradeRequest("127.0.0.1", port, path);
-    req.once("error", reject);
-    req.once("upgrade", (res, socket, head) => {
-      t.after(() => socket.destroy());
-      assert.equal(res.headers["sec-websocket-accept"], "ICX+Yqv66kxgM0FcWaLWlFLwTAI=", "RFC 6455's accept value");
-      socket.got = Buffer.from(head);
-      socket.on("data", (d) => { socket.got = Buffer.concat([socket.got, d]); socket.emit("got"); });
-      resolve(socket);
-    });
-    req.once("response", (res) => { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); });
-    req.end();
-  });
-  const frames = (s) => parseFrames(s.got).frames;
-  const until = async (s, pred) => { while (!pred(frames(s))) await once(s, "got"); return frames(s); };
-  const register = async (s, id) => {
-    const [c] = await until(s, (fs) => fs.length >= 1);
-    s.write(frame(2, registration(id, `127.0.0.1:${port}`, c.payload.subarray(1))));
-    await until(s, (fs) => fs.some((x) => x.payload[0] === 0x01));
-  };
-  const ida = identity(), idb = identity();
-  const a = await open("/v1/"), b = await open("/v1/");
-  await register(a, ida);
-  await register(b, idb);
-  const ticket = randomBytes(16);
-  a.write(call(idb.pk, ticket));
-  const ring = (await until(b, (fs) => fs.some((x) => x.payload[0] === 0x05))).find((x) => x.payload[0] === 0x05);
-  const sa = await open(splicePath(ticket.toString("hex")));
-  const sb = await open(splicePath(ring.payload.subarray(33).toString("hex")));
-  // Large enough to cross the ws module, which unmasks a long payload.
-  const payload = randomBytes(1_000_000);
-  sa.write(frame(2, payload, randomBytes(4)));
-  const [got] = await until(sb, (fs) => fs.length >= 1);
-  assert.deepEqual(got.payload, payload);
+  const a = await node(t), b = await node(t);
+  const heard = [];
+  const rooms = (n) => roomsOn(n, (room, key, present) => heard.push([n.key, room, key, present]));
+  const ra = rooms(a), rb = rooms(b);
+  assert.equal(await a.relay(url), 1, "a registers");
+  assert.equal(await b.relay(url), 1, "b registers");
+  assert.equal(await ra.join("lobby"), true);
+  assert.equal(await rb.join("lobby"), true);
+  const saw = (who, key, present) => heard.some(([w, room, k, p]) => w === who && room === "lobby" && k === key && p === present);
+  await waitFor(() => saw(a.key, b.key, true) && saw(b.key, a.key, true));
+  // a calls b through the relay, the channel handshake running end to end in the splice,
+  // under the contact secret b's address carries, by default its key's own.
+  const bSecret = await b.net(new OpArgs("contact"));
+  assert.equal(bSecret.length, 32, "a node has a contact secret by default");
+  await a.net(new OpArgs("addr").blob(b.id.publicKey).blob(bSecret).text("relay+" + url));
+  assert.deepEqual([...(await a.net(new OpArgs("dial").blob(b.id.publicKey).u32(10_000)))], [1], "linked");
+  await rb.leave("lobby");
+  await waitFor(() => saw(a.key, b.key, false));
 
   const udp = createSocket("udp4");
   t.after(() => udp.close());
@@ -879,62 +868,30 @@ test("real sockets: register, call and splice through a running relay", { timeou
   udp.send(binding(), stunPort, "127.0.0.1");
   const [res] = await once(udp, "message");
   assert.deepEqual(mapped(res), ["127.0.0.1", udp.address().port], "the relay answers STUN");
-
-  // Two apps meet in a room through rooms.mjs, as seedshell and seedstore do.
-  const heard = [];
-  const client = (id) => roomClientFor(t, port, id,
-    { onMember: (room, key, present) => heard.push([id.pk.toString("hex"), room, key, present]) });
-  const ra = client(ida), rb = client(idb);
-  await ra.join("lobby");
-  await rb.join("lobby");
-  const saw = (who, key, present) => heard.some(([w, room, k, p]) => w === who && room === "lobby" && k === key && p === present);
-  const [ha, hb] = [ida.pk.toString("hex"), idb.pk.toString("hex")];
-  await waitFor(() => saw(ha, hb, true) && saw(hb, ha, true));
-  await rb.leave("lobby");
-  await waitFor(() => saw(ha, hb, false));
 });
 
-test("real sockets: rooms.mjs proves the secret of a relay started with one", { timeout: 20000 }, async (t) => {
-  const secret = "correct horse battery";
-  const { output, port } = await startRelay(t, [], { RELAY_SECRETS: secret });
-  assert.match(output, /registration: needs a secret/);
-  const heard = [];
-  const client = (id) => roomClientFor(t, port, id,
-    { secret, blake2b, onMember: (_room, key, present) => heard.push([id.pk.toString("hex"), key, present]) });
-  assert.throws(() => roomClient({ relay: "ws://127.0.0.1:1", publicKey: Buffer.alloc(32), sign, secret }),
-    /a secret needs blake2b/);
-  const ida = identity(), idb = identity();
-  await client(ida).join("lobby");
-  await client(idb).join("lobby");
-  const [ha, hb] = [ida.pk.toString("hex"), idb.pk.toString("hex")];
-  const saw = (who, key) => heard.some(([w, k, p]) => w === who && k === key && p);
-  await waitFor(() => saw(ha, hb) && saw(hb, ha));
+test("real sockets: a relay started with a secret registers only a node that holds it", { timeout: 30000 }, async (t) => {
+  const { output, url } = await startRelay(t, [], { RELAY_SECRETS: SECRET });
+  assert.match(output, /registration: needs a contact secret/);
+  assert.ok(url.includes(`.${SECRET}@`), "the URL it prints carries the secret");
+  const a = await node(t), b = await node(t);
+  assert.equal(await a.relay(url), 1, "the secret in the URL registers");
+  assert.equal(await b.relay(url.replace(`.${SECRET}`, "")), 2, "without it the relay is silent, and the node redials");
 });
 
-/** Just enough of a browser WebSocket over node:http for rooms.mjs: binary messages in and
- *  out, and a close. */
-class TestWebSocket {
-  constructor(url) {
-    const u = new URL(url);
-    const req = upgradeRequest(u.hostname, u.port, u.pathname);
-    req.once("upgrade", (_res, socket, head) => {
-      this.socket = socket;
-      let buf = Buffer.from(head);
-      const take = (d) => {
-        buf = Buffer.concat([buf, d]);
-        const { frames, used } = parseFrames(buf);
-        buf = buf.subarray(used);
-        for (const f of frames) {
-          if (f.opcode === 2) this.onmessage?.({ data: f.payload.buffer.slice(f.payload.byteOffset, f.payload.byteOffset + f.payload.length) });
-        }
-      };
-      socket.on("data", take);
-      socket.once("close", () => this.onclose?.());
-      take(Buffer.alloc(0));
-    });
-    req.once("error", () => this.onclose?.());
-    req.end();
-  }
-  send(bytes) { this.socket.write(frame(2, Buffer.from(bytes))); }
-  close() { this.socket?.destroy(); }
-}
+test("real sockets: --key keeps the relay's identity, and so its URL, across starts", { timeout: 30000 }, async (t) => {
+  const key = fileURLToPath(new URL(`../.test-relay-${process.pid}.key`, import.meta.url));
+  t.after(async () => (await import("node:fs")).rmSync(key, { force: true }));
+  const first = await startRelay(t, ["--key", key]);
+  const second = await startRelay(t, ["--key", key]);
+  const userinfo = (url) => url.slice(0, url.indexOf("@"));
+  assert.equal(userinfo(first.url), userinfo(second.url), "the key, and the secret derived from it");
+  const fresh = await startRelay(t);
+  assert.notEqual(fresh.url.slice(5, 69), first.url.slice(5, 69));
+  assert.match(fresh.output, /new this run/);
+});
+
+/** A WebSocket upgrade request to `path` on `host`:`port`. */
+const upgradeRequest = (host, port, path) => request({ host, port, path, headers: {
+  Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": WS_KEY,
+} });
