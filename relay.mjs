@@ -14,6 +14,7 @@ import { loadCrypto } from "seedkernel-wasm";
 import { bootShell } from "seedkernel-wasm/shell-core";
 import { nodeChannels, nodeDatagrams } from "seedkernel-wasm/shell-node";
 import { OpArgs } from "seedkernel-wasm/op-frame";
+import { TRANSPORT_SERVICE } from "seedkernel-wasm/transport-bundle";
 import { deriveNodeKey } from "seedkernel-wasm/subkeys";
 
 // ─── limits ──────────────────────────────────────────────────────────────
@@ -44,8 +45,9 @@ const MAX_PER_ROOM = 1024;
 /** The UDP port STUN is answered on by default, and the next. */
 const STUN_PORT = 3478;
 
-/** The local service id the bundle claims, for the host's `start` and `close`. */
-export const RELAY_SERVICE = "_relay";
+/** The local service id the bundle claims, for the host's `start`, `close` and `contact`:
+ *  the transport's own, which a native node's CLI asks for the contact secret at boot. */
+export const RELAY_SERVICE = TRANSPORT_SERVICE;
 
 // The command line, flag by flag: its limit, environment variable, and the largest integer
 // it takes (Infinity for any number).

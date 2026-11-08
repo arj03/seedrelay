@@ -326,9 +326,9 @@ writes the file from the same flags the bin takes. The node's `--listen` takes t
 `--host` and `--port`; every listener speaks HTTP and WebSocket, whatever its label. The
 node's key (`--key`) is the relay's identity, the key its URL names, so keep that file;
 it also keeps a data directory (`--dir`), which the relay does not use. Its log lines go to the node's console.
-On a native node the heartbeat and STUN start with the first connection, since nothing
-reaches the bundle before one, and `SIGINT` ends the process at once, without the `1012`
-goodbye.
+At boot the node prints its key and, as `contact`, the secret its URL carries, so the
+relay's URL is `ws://<key>.<contact>@<host>:<port>`; an open relay prints `contact open`.
+On a native node `SIGINT` ends the process at once, without the `1012` goodbye.
 
 ## Deploying publicly
 
@@ -517,7 +517,7 @@ with `--relay-secret`.
 | Path | What it is |
 | --- | --- |
 | `bundle/relay.skb` | The relay bundle, signed: what the bin and a native node run. |
-| `guest/relay.js` | Its source: the bundle's guest program, run by a seedkernel node as its link occupant. It reads its settings from the signed defaults and the operator's `LOCAL`, takes the host's link events (accepted sockets, their bytes, closes, datagrams, the wake), and answers the host-only `start` and `close` on the service id `_relay`. |
+| `guest/relay.js` | Its source: the bundle's guest program, run by a seedkernel node as its link occupant. It reads its settings from the signed defaults and the operator's `LOCAL`, takes the host's link events (accepted sockets, their bytes, closes, datagrams, the wake), and answers the host-only `start`, `close` and `contact` on the transport's service id, `_net`. |
 | `relay.mjs` | The Node side: `parseOptions` for the command line, `relayConfig` (the settings the bundle reads) and the signed defaults, and `startRelay`, which runs `relay.skb` on a seedkernel node in this process. |
 | `rooms.mjs` | The room client apps use in the browser and on Node, over the node's transport: `roomClient` and `roomId`. |
 | `server.mjs` | The `seedrelay` bin: parses the command line, starts the relay, prints what it serves and its log lines, and closes with `1012` on shutdown. The option list is also in its header comment. |

@@ -185,12 +185,14 @@ test("a relay takes only nodes that hold the secret its URL carries, its key's o
   const none = await f.member({ secret: "00".repeat(32) }), wrong = await f.member({ secret: "33".repeat(32) });
   assert.equal(typed(none).length + typed(wrong).length, 0, "no secret, or another, draws silence");
   assert.equal(ofType(await f.member(), 0x01).length, 1, "the relay's own registers");
+  assert.equal(Buffer.from(await f.relay.call("contact")).toString("hex"), f.relay.secret, "contact answers it, for the native CLI to print");
 });
 
 test("an open relay takes any node, and a relay with --open takes no secret", async () => {
   const f = await fixture(["--open"]);
   assert.equal(f.relay.secret, null);
   assert.equal(ofType(await f.member({ secret: "00".repeat(32) }), 0x01).length, 1, "a node with no secret registers");
+  assert.equal((await f.relay.call("contact")).length, 0, "contact answers none");
   assert.throws(() => parseOptions(["--open", "--secret", SECRET]), /--open takes no --secret/);
 });
 
@@ -200,6 +202,7 @@ test("a relay with secrets registers only nodes that hold one, which never cross
   assert.equal(typed(none).length + typed(wrong).length, 0, "no secret, or another, draws silence");
   assert.equal(ofType(await f.member({ secret: SECRET }), 0x01).length, 1, "registered");
   assert.equal(ofType(await f.member({ secret: OTHER_SECRET }), 0x01).length, 1, "under either secret");
+  assert.equal(Buffer.from(await f.relay.call("contact")).toString("hex"), SECRET, "contact answers the first");
   assert.equal(f.logs.join("\n").includes(SECRET), false);
   // Splice sockets need only their tickets, which only registered links are given.
   const caller = await f.member({ secret: SECRET }), callee = await f.member({ secret: SECRET });

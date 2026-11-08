@@ -126,10 +126,12 @@ export async function relayRealm(args = []) {
      *  for an open relay. */
     secret: options.open ? null : options.secrets[0] ?? Buffer.from(sodium.crypto_generichash(32,
       Buffer.concat([CONTACT_TAG, sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, CONTACT_TAG]), id.privateKey)]), null)).toString("hex"),
-    /** Hand the relay one event from the host, and let everything it set off finish. */
+    /** Hand the relay one event from the host, let everything it set off finish, and give
+     *  its answer. */
     async event(args) {
-      await context.handle(args.build(ZERO32));
+      const out = await context.handle(args.build(ZERO32));
       await settle();
+      return out;
     },
     /** A TCP socket accepted from `address`. */
     async tcp(address = "127.0.0.1") {
@@ -138,7 +140,7 @@ export async function relayRealm(args = []) {
       await relay.event(new OpArgs("linkOpen").u32(link.linkId).u8(1).text("ws").u32(0).text(address));
       return link;
     },
-    /** The host's `start` and `close`, on the relay's service id. */
+    /** The host's `start`, `close` and `contact`, on the relay's service id: the answer. */
     call: (op) => relay.event(new OpArgs(op)),
     /** A datagram on the first STUN socket from `ip`:`port`: the relay's answer, or null. */
     async stun(msg, ip, port) {

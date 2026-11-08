@@ -306,6 +306,8 @@ async function acceptSecrets() {
   if (openRelay) return [new Uint8Array(32)];
   return configuredSecrets.length > 0 ? configuredSecrets : [await keySecret()];
 }
+/** The secret a relay link presents, which the relay's URL carries; empty for an open relay. */
+async function urlSecret() { return openRelay ? EMPTY : (await acceptSecrets())[0]; }
 /** The first of the two UDP ports STUN is answered on; 0 lets the OS pick both, and null
  *  answers none. */
 const stunPort = setting("stun");
@@ -1375,8 +1377,8 @@ const ops = {
         at += 5 + n + len;
         const answer = stun(msg, ip, port);
         if (!answer) continue;
-        const to = utf8Encode(ipText(ip));
-        answers.push(u32(socket), of(to.length), to, of(port >> 8, port & 255, answer.length >> 8, answer.length & 255), answer);
+        // Back to the address it came from, spelled as the read batch spells it.
+        answers.push(u32(socket), of(n), ip, of(port >> 8, port & 255, answer.length >> 8, answer.length & 255), answer);
       }
     }
     if (answers.length > 0) void host.call(N_UDP_SEND, concatBytes(answers)).catch(() => {});
@@ -1385,8 +1387,14 @@ const ops = {
    *  `[len u8][secret len][port u16]*`, the secret empty for an open relay. */
   async start() {
     const ports = await start();
-    const secret = openRelay ? EMPTY : (await acceptSecrets())[0];
+    const secret = await urlSecret();
     return concatBytes([of(secret.length), secret, ...ports.map((p) => of(p >> 8, p & 255))]);
+  },
+  /** `contact`: the secret the relay's URL carries, as the transport's op answers it, so a
+   *  native node prints it beside the key. It reads only: the secrets are the config's. */
+  async contact(r) {
+    if (r.more()) throw new Error("relay: contact sets no secret; the config's secrets do");
+    return urlSecret();
   },
   /** Tell every socket the relay is restarting. */
   close() { closeAll(); },
