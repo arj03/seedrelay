@@ -1,7 +1,7 @@
 // The relay bundle's guest program, as relay.skb carries it, in a realm of its own behind a
 // host that stands in for seedkernel's: links that record what the relay writes, a clock
 // the test moves, and the host calls the relay makes (`node/sign` and `node/verify` under
-// the link scope with the relay's own key, BLAKE2b, ChaCha20-Poly1305, X25519, entropy,
+// the link scope with the relay's own key, SHA-256, AES-256-GCM, X25519, entropy,
 // the ML-KEM module, and the ws module's masking and accept value). Slow readers, exact
 // budget boundaries and timeouts are deterministic this way; test/relay.test.mjs also runs
 // the bin over real sockets.
@@ -90,15 +90,15 @@ export async function relayRealm(args = []) {
     "timer/arm": (a) => { wakeAt = now + a.readUInt32BE(0); return answer([]); },
     "node/sign": (a) => answer(sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, a]), id.privateKey)),
     "node/verify": (a) => answer([sodium.crypto_sign_verify_detached(a.subarray(32, 96), Buffer.concat([DOMAIN_LINK_SCOPE, a.subarray(96)]), a.subarray(0, 32)) ? 1 : 0]),
-    "crypto/blake2b": (a) => answer(sodium.crypto_generichash(a[0], a.subarray(2 + a[1]), a[1] ? a.subarray(2, 2 + a[1]) : null)),
-    "crypto/chacha20poly1305-ietf/seal": (a) => {
+    "crypto/sha256": (a) => answer(sodium.sha256(a)),
+    "crypto/aes256gcm/seal": (a) => {
       const { npub, key, ad, msg } = aead(a);
-      return answer(sodium.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key));
+      return answer(sodium.aesGcmSeal(key, npub, ad ?? Buffer.alloc(0), msg));
     },
-    "crypto/chacha20poly1305-ietf/open": (a) => {
+    "crypto/aes256gcm/open": (a) => {
       const { npub, key, ad, msg } = aead(a);
-      try { return answer(Buffer.concat([Buffer.of(1), sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, msg, ad, npub, key)])); }
-      catch { return answer([0]); }
+      const pt = sodium.aesGcmOpen(key, npub, ad ?? Buffer.alloc(0), msg);
+      return answer(pt === null ? [0] : Buffer.concat([Buffer.of(1), pt]));
     },
     "crypto/x25519/dh": (a) => {
       try { return answer(Buffer.concat([Buffer.of(1), sodium.crypto_scalarmult(a.subarray(0, 32), a.subarray(32, 64))])); }
@@ -109,10 +109,12 @@ export async function relayRealm(args = []) {
     ws: (a) => answer(wsModule(a)),
   };
   // As seedkernel's host writes them in front of a guest: HOST, APP and LOCAL.
+  const asBuffer = (b) => (ArrayBuffer.isView(b) ? Buffer.from(b.buffer, b.byteOffset, b.byteLength) : Buffer.from(b));
   const preamble = (name, value) => `const ${name} = JSON.parse(${JSON.stringify(JSON.stringify(value))});\n`;
   const context = vm.createContext({
     performance: { now: () => now },
-    host: { call: (name, bytes) => calls[name](Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)) },
+    // Bytes, or an array of them laid back to back, as seedkernel's realm takes them.
+    host: { call: (name, bytes) => calls[name](Array.isArray(bytes) ? Buffer.concat(bytes.map(asBuffer)) : asBuffer(bytes)) },
   });
   vm.runInContext(preamble("HOST", { identity: Buffer.from(id.publicKey).toString("hex") }) + preamble("APP", manifest.guest.config) + preamble("LOCAL", relayConfig(options)) + source, context);
 
@@ -124,8 +126,8 @@ export async function relayRealm(args = []) {
      *  first, or the one the relay derives from its key, a hash of its signature over a
      *  fixed tag (seedkernel's `keySecret`), worked out here apart from the guest; null
      *  for an open relay. */
-    secret: options.open ? null : options.secrets[0] ?? Buffer.from(sodium.crypto_generichash(32,
-      Buffer.concat([CONTACT_TAG, sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, CONTACT_TAG]), id.privateKey)]), null)).toString("hex"),
+    secret: options.open ? null : options.secrets[0] ?? Buffer.from(sodium.sha256(
+      Buffer.concat([CONTACT_TAG, sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, CONTACT_TAG]), id.privateKey)]))).toString("hex"),
     /** Hand the relay one event from the host, let everything it set off finish, and give
      *  its answer. */
     async event(args) {

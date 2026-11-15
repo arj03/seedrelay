@@ -6,14 +6,14 @@
 // The bundle is the guest, seedkernel's channel (util.js, ake.js and framing.js, with the
 // op-frame seedkernel's host speaks put in at its marker) and then guest/relay.js, with
 // seedkernel's ws.wasm and mlkem768.wasm, under the signed defaults (relay.mjs). relay.skb
-// is rewritten only when that content changed, since every signature differs; `--check`
-// fails instead when it would be. The author key is `--key <hex seed>` or relay.key,
-// written on the first build.
+// is rewritten only when that content changed or its signature no longer verifies, since
+// every signature differs; `--check` fails instead when it would be. The author key is
+// `--key <hex seed>` or relay.key, written on the first build.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { loadCrypto } from "seedkernel-wasm";
-import { envelopeBody } from "seedkernel-wasm/bundle";
+import { envelopeBody, verifyBundle } from "seedkernel-wasm/bundle";
 import { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } from "seedkernel-wasm/bundle-author";
 import { readChannelSource } from "seedkernel-wasm/guest-source";
 import { RELAY_BUNDLE, RELAY_DEFAULTS, RELAY_SERVICE } from "../relay.mjs";
@@ -46,7 +46,15 @@ const { blob } = authorBundle(sodium, hybridAuthorKeysFromSeed(sodium, new Uint8
   guestConfig: RELAY_DEFAULTS,
 });
 
-const current = existsSync(RELAY_BUNDLE) &&
+const verifies = (b) => {
+  try {
+    verifyBundle(sodium, b);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const current = existsSync(RELAY_BUNDLE) && verifies(readFileSync(RELAY_BUNDLE)) &&
   Buffer.compare(envelopeBody(readFileSync(RELAY_BUNDLE), "relay.skb"), envelopeBody(blob, "relay.skb")) === 0;
 if (check) {
   if (!current) {
