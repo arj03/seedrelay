@@ -1,6 +1,6 @@
 {
   "name": "seedrelay",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "App-neutral relay for seedkernel nodes, as a signed seedkernel bundle: signed registration, rooms and splices.",
@@ -20,7 +20,8 @@
   "scripts": {
     "start": "node server.mjs",
     "build": "node scripts/build.mjs",
-    "test": "node --test test/relay.test.mjs"
+    "test": "node --test test/relay.test.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "seedkernel-wasm": "file:../seedkernel/WASM"

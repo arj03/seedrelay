@@ -82,6 +82,7 @@ npx seedrelay 8080
 | `npm run start` | Starts the relay (`node server.mjs`). Arguments after `--` are passed through. |
 | `npm run build` | Signs seedkernel's channel and `guest/relay.js` into `relay.skb` under `relay.key`, written on the first build. It rewrites `relay.skb` only when the bundle's content changed, since every signature differs. |
 | `npm test` | Runs the relay tests with `node --test`, one of which fails while `relay.skb` is behind `guest/relay.js`. |
+| `npm run release` | Tags HEAD as `v<version>` and opens a draft GitHub release carrying `relay.skb`, once the tree and the sibling seedkernel are clean, the bundle is current and the tests pass. Bump the version in `package.json`, commit, then release. |
 
 ## Running the server
 
@@ -298,9 +299,15 @@ With `--stun off`, pairs on different networks mostly stay relayed.
 
 The native seedkernel binary runs `bundle/relay.skb` as its transport, with no Node and
 nothing to build: copy the binary and `relay.skb` to the server, write the settings, and
-start it.
-The binary must come from a seedkernel as new as this relay, whose host the relay relies
-on (`link/pause` among others).
+start it. Both come from releases: the [seedkernel
+release](https://github.com/arj03/seedkernel/releases/latest) for the binary, 0.1 or
+later, and the [seedrelay release](https://github.com/arj03/seedrelay/releases/latest) for
+`relay.skb`, whose notes name the seedkernel it was built with. Releases of `relay.skb`
+are signed by this bundle author:
+
+```
+3946ed318bf777e840ae3cf17ce2e3124b83683f582437244af253eeb5837fcb
+```
 
 ```sh
 cat > relay.json <<'EOF'
