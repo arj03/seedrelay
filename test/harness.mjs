@@ -6,6 +6,7 @@
 // budget boundaries and timeouts are deterministic this way; test/relay.test.mjs also runs
 // the bin over real sockets.
 
+import assert from "node:assert/strict";
 import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -151,7 +152,11 @@ export async function relayRealm(args = []) {
       const before = sent.length;
       await relay.event(new OpArgs("datagrams").u32(1).blob(batch));
       if (sent.length === before) return null;
-      const out = sent.at(-1), p = 5 + out[4];
+      // One socket's group, `[socket u32][len u32]`, holding the one answer.
+      const out = sent.at(-1);
+      assert.equal(out.readUInt32BE(0), 1, "the answer goes from the socket the request came in on");
+      assert.equal(out.readUInt32BE(4), out.length - 8, "in one group");
+      const p = 8 + 1 + out[8];
       return out.subarray(p + 4);
     },
     /** Move the clock on, waking the relay at each time it asked to be woken by then. */

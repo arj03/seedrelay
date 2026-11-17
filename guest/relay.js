@@ -1364,11 +1364,14 @@ const ops = {
     const entry = conns.get(r.u32());
     if (entry) gone(entry);
   },
+  // `link/udpSend` takes a turn's datagrams in groups by socket, `[socket u32][len u32]`
+  // and then the group's datagrams, so each batch's answers go back as one group.
   datagrams(r) {
-    const answers = [];
+    const groups = [];
     while (r.more()) {
       const socket = r.u32(), b = r.blob();
       if (!stunSockets.has(socket)) continue;
+      const answers = [];
       for (let at = 0; at + 5 <= b.length;) {
         const n = b[at];
         const ip = b.subarray(at + 1, at + 1 + n);
@@ -1378,10 +1381,13 @@ const ops = {
         const answer = stun(msg, ip, port);
         if (!answer) continue;
         // Back to the address it came from, spelled as the read batch spells it.
-        answers.push(u32(socket), of(n), ip, of(port >> 8, port & 255, answer.length >> 8, answer.length & 255), answer);
+        answers.push(of(n), ip, of(port >> 8, port & 255, answer.length >> 8, answer.length & 255), answer);
       }
+      if (answers.length === 0) continue;
+      const group = concatBytes(answers);
+      groups.push(u32(socket), u32(group.length), group);
     }
-    if (answers.length > 0) void host.call(N_UDP_SEND, concatBytes(answers)).catch(() => {});
+    if (groups.length > 0) void host.call(N_UDP_SEND, concatBytes(groups)).catch(() => {});
   },
   /** `start`: answers the contact secret a relay link presents and then the STUN ports,
    *  `[len u8][secret len][port u16]*`, the secret empty for an open relay. */
