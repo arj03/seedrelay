@@ -15,9 +15,11 @@
 //   --user USER        the user to run as once bound; required when started as root
 //   --group GROUP      the group to run as (default USER's primary group)
 //
-// The relay sees this front as its client, so it needs --trusted-proxy with the address
-// this front dials it from (127.0.0.1) to read the visitor's own from X-Forwarded-For,
-// and --allow-origin https://NAME:PORT for the page.
+// The relay sees this front as its client, so it needs the address this front dials it
+// from (127.0.0.1) in trustedProxies to read the visitor's own from X-Forwarded-For, and
+// https://NAME:PORT in allowOrigins for the page (on Node: --trusted-proxy and
+// --allow-origin). It holds at most 256 sockets, and gives a client 10 seconds for its
+// headers and 60 for its request.
 //
 // The certificate is read once: restart the front after it renews. It is read, and the
 // port bound, before the front drops to --user, so --root must be readable by that user.
