@@ -1,6 +1,6 @@
 // The relay bundle's guest program, as relay.skb carries it, in a realm of its own behind a
 // host that stands in for seedkernel's: links that record what the relay writes, a clock
-// the test moves, and the host calls the relay makes (`node/sign` and `node/verify` under
+// the test moves, and the host calls the relay makes (`identity/sign` and `identity/verify` under
 // the link scope with the relay's own key, SHA-256, AES-256-GCM, X25519, entropy,
 // the ML-KEM module, and the ws module's masking and accept value). Slow readers, exact
 // budget boundaries and timeouts are deterministic this way; test/relay.test.mjs also runs
@@ -89,8 +89,8 @@ export async function relayRealm(args = []) {
     "link/udpBind": (a) => answer(Buffer.concat([u32(++nextSocket), a.subarray(0, 2)])),
     "link/udpSend": (a) => { sent.push(Buffer.from(a)); return answer([]); },
     "timer/arm": (a) => { wakeAt = now + a.readUInt32BE(0); return answer([]); },
-    "node/sign": (a) => answer(sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, a]), id.privateKey)),
-    "node/verify": (a) => answer([sodium.crypto_sign_verify_detached(a.subarray(32, 96), Buffer.concat([DOMAIN_LINK_SCOPE, a.subarray(96)]), a.subarray(0, 32)) ? 1 : 0]),
+    "identity/sign": (a) => answer(sodium.crypto_sign_detached(Buffer.concat([DOMAIN_LINK_SCOPE, a]), id.privateKey)),
+    "identity/verify": (a) => answer([sodium.crypto_sign_verify_detached(a.subarray(32, 96), Buffer.concat([DOMAIN_LINK_SCOPE, a.subarray(96)]), a.subarray(0, 32)) ? 1 : 0]),
     "crypto/sha256": (a) => answer(sodium.sha256(a)),
     "crypto/aes256gcm/seal": (a) => {
       const { npub, key, ad, msg } = aead(a);

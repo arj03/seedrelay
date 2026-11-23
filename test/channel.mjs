@@ -39,7 +39,7 @@ export function identity() {
   return { pk: Buffer.from(kp.publicKey), sk: kp.privateKey };
 }
 
-/** Sign as seedkernel's `node/sign` does, under the host's link scope. */
+/** Sign as seedkernel's `identity/sign` does, under the host's link scope. */
 export const nodeSign = (id, msg) => Buffer.from(sodium.crypto_sign_detached(cat(DOMAIN_LINK_SCOPE, msg), id.sk));
 
 /** A relay link from `id` to the relay whose key is `relayPk`, presenting `secret` (the

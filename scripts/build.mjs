@@ -42,7 +42,7 @@ const { blob } = authorBundle(sodium, hybridAuthorKeysFromSeed(sodium, new Uint8
     { name: "mlkem", wasm: readFileSync(new URL(import.meta.resolve("seedkernel-wasm/mlkem768.wasm"))) },
   ],
   guestSource: guest,
-  guestRequires: ["node", "link", "timer"],
+  guestRequires: ["identity", "link", "timer"],
   guestConfig: RELAY_DEFAULTS,
 });
 
