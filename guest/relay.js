@@ -1333,10 +1333,10 @@ function closeAll() {
   for (const entry of all) shut(entry, entry.conn !== null);
 }
 
-// ─── the one entrypoint ──────────────────────────────────────────────────
+// ─── the entrypoint ──────────────────────────────────────────────────────
 //
-// `handle([caller 32][op envelope])`. The host's raw-link events, its wake and the host's
-// own ops come from the host's caller id; this program takes nothing from an app.
+// `onHost(op envelope)`: the host's raw-link events, its wake and the host's own ops. It is
+// the relay's only entrypoint, so it takes nothing from a peer or an app (seedkernel §12.3).
 
 /** Each event's fields, read in the order the host writes them (seedkernel §12.2). */
 function fields(args) {
@@ -1406,9 +1406,7 @@ const ops = {
   close() { closeAll(); },
 };
 
-function handle(argBytes) {
-  const { fromHost, body } = callerOf(argBytes);
-  if (!fromHost) throw new Error("relay: takes nothing from an app");
+function onHost(body) {
   const { op, args } = readOp(body);
   const fn = Object.prototype.hasOwnProperty.call(ops, op) ? ops[op] : null;
   if (!fn) throw new Error("relay: no op '" + op + "'");

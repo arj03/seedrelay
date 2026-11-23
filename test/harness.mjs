@@ -15,7 +15,6 @@ import { DOMAIN_LINK_SCOPE, mlkem, sodium } from "./channel.mjs";
 import { OpArgs } from "seedkernel-wasm/op-frame";
 import { DEFAULT_LIMITS, parseOptions, RELAY_BUNDLE, relayConfig } from "../relay.mjs";
 
-const ZERO32 = new Uint8Array(32);
 const CONTACT_TAG = Buffer.from("seedkernel-contact-secret-v1\0");
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const u32 = (v) => Buffer.from([v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
@@ -132,7 +131,7 @@ export async function relayRealm(args = []) {
     /** Hand the relay one event from the host, let everything it set off finish, and give
      *  its answer. */
     async event(args) {
-      const out = await context.handle(args.build(ZERO32));
+      const out = await context.onHost(args.build());
       await settle();
       return out;
     },
